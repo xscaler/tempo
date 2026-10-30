@@ -55,8 +55,8 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - name: Install crane
-        run: .github/scripts/xs-install-tools.sh crane
+      - name: Install crane and cosign
+        run: .github/scripts/xs-install-tools.sh crane cosign
 
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -78,14 +78,26 @@ jobs:
           # Sort key: upstream version (V), then the number after -xs. (numeric).
           sorted="$(printf '%s\n' "$tags" | awk -F'-xs[.]' 'NF == 2 { print substr($1, 2) " " $2 " " $0 }' | sort -k1,1V -k2,2n | awk '{ print $3 }' | tac)"
 
+          # A tag counts only when its image exists and carries a cosign
+          # signature from the exact main release identity. Otherwise the next
+          # lower tag is tried.
+          identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml@refs/heads/main"
           chosen=""
           for t in $sorted; do
             digest="$(.github/scripts/xs-image-digest.sh "${GHCR_REPO}:${t#v}")"
-            if [ -n "$digest" ]; then
-              chosen="$t"
-              break
+            if [ -z "$digest" ]; then
+              echo "no image for ${t}, skipping"
+              continue
             fi
-            echo "no image for ${t}, skipping"
+            if ! cosign verify \
+                --certificate-identity "$identity" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                "${GHCR_REPO}@${digest}" > /dev/null 2>&1; then
+              echo "::warning::${t} at ${digest} has no valid signature from ${identity}, skipping"
+              continue
+            fi
+            chosen="$t"
+            break
           done
 
           if [ -z "$chosen" ]; then

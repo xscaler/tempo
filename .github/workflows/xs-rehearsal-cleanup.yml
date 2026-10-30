@@ -43,7 +43,21 @@ jobs:
           fi
           ids="$(gh api --paginate "orgs/${OWNER}/packages/container/${PACKAGE}/versions?per_page=100" \
             --jq ".[] | select(.updated_at < \"${cutoff}\") | .id")"
+          # A failed delete is logged and the loop goes on. The job fails only
+          # when there were versions to delete and none could be.
+          candidates=0
+          deleted=0
           for id in $ids; do
+            candidates=$((candidates + 1))
             echo "deleting version ${id}"
-            gh api -X DELETE "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}"
+            if gh api -X DELETE "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}"; then
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::could not delete version ${id}"
+            fi
           done
+          echo "deleted ${deleted} of ${candidates} old versions"
+          if [ "$candidates" -gt 0 ] && [ "$deleted" -eq 0 ]; then
+            echo "::error::none of the ${candidates} old versions could be deleted"
+            exit 1
+          fi

@@ -1,24 +1,31 @@
 name: xs-test
 
-# Runs upstream's own lint, unit, integration and build checks against this
-# fork. The jobs mirror .github/workflows/ci.yml and call the same make
-# targets. Upstream's ci.yml is disabled in this repo and left untouched.
+# Runs upstream's own lint, unit, integration, build, vendor, jsonnet, docs,
+# tools-test and govulncheck checks against this fork. The jobs mirror
+# .github/workflows/ci.yml, tools-tests.yml and govulncheck.yml and call the
+# same make targets. Upstream's workflows are disabled in this repo and left
+# untouched.
 #
-# Not mirrored from ci.yml:
-#   coverage-annotations  needs a pull request diff and only decorates the PR
-#                         with uncovered lines through a Grafana-owned action
+# Not mirrored from upstream:
+#   coverage-annotations  decorates a pull request with uncovered lines through
+#                         a Grafana-owned action
+#   coverage artifact upload  only feeds coverage-annotations
+#
+# A pull request from a branch of this repo triggers both push and
+# pull_request; the concurrency group is keyed on the branch so one cancels
+# the other.
 
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main, 'ci/**']
+    branches: ['**']
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * 1'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions: {}
@@ -302,3 +309,80 @@ jobs:
 
       - name: Build website
         run: docker run -v "${PWD}/docs/sources:/hugo/content/docs/tempo/latest" --rm grafana/docs-base@sha256:359eb0d09bbd3a9ff7077fd6ce6227dd0e0f3ce1629ce0530c6565f8c34b16ec make prod
+
+  tools-tests:
+    name: Tools unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'tools/go.mod'
+
+      - name: Run tools unit tests
+        working-directory: tools
+        run: go test ./...
+
+      - name: Run version-tag tests
+        run: ./tools/version-tag_test.sh
+
+  # Fails only on reachable vulnerabilities that a pull request introduces.
+  govulncheck:
+    name: Run govulncheck
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # The pull request head merged onto its base, into ./head.
+      - name: Check out the head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: head
+          persist-credentials: false
+
+      # The exact base commit the merge ref was built from, into ./base.
+      - name: Check out the base
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: head/go.mod
+
+      # Pinned so the gate is reproducible.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+
+      - name: Check for new CVEs
+        run: |
+          set -euo pipefail
+          # In -json mode govulncheck exits 0 even when it finds vulns, so a
+          # non-zero exit is a real scan error. The jq filter keeps reachable
+          # (symbol-level) findings, which carry a function frame in trace[0].
+          scan() { govulncheck -json ./... | jq -r 'select(.finding.trace[0].function != null) | .finding.osv' | sort -u; }
+
+          (cd head && scan) > head.ids
+          (cd base && scan) > base.ids
+
+          # Column 2 of comm -13 is OSV IDs in head but not in base.
+          new="$(LC_ALL=C comm -13 base.ids head.ids)"
+          if [ -n "$new" ]; then
+            echo "::error::This PR introduces CVEs not present in the base branch:"
+            echo "$new"
+            exit 1
+          fi
+          echo "No new CVE."

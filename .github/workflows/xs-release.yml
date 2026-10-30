@@ -14,10 +14,10 @@ name: xs-release
 #              ghcr.io/xscaler/tempo:<upstream version>-xs.<n>, signed as
 #              refs/heads/main. The git tag is created last, after the image is
 #              published and verified.
-#   rehearsal  push to ci/**. Runs the same publish path against
+#   rehearsal  push to ci/** only. Runs the same publish path against
 #              ghcr.io/xscaler/rehearsal/tempo:<short sha>, signed as
 #              refs/heads/<branch>. Never touches ghcr.io/xscaler/tempo.
-#   verify     pull_request, push to main and tag pushes. Builds both arches,
+#   verify     pull_request, push to any other branch and tag pushes. Builds both arches,
 #              scans, and runs the publish steps against a local registry.
 #              Nothing is pushed to GHCR or signed.
 #
@@ -45,7 +45,7 @@ name: xs-release
 
 on:
   push:
-    branches: [main, 'ci/**']
+    branches: ['**']
     tags: ['v*-xs.*']
   pull_request:
     branches: [main]
@@ -60,9 +60,11 @@ on:
         type: string
         required: false
 
-# One group for every release-mode run, so bursts queue.
+# One group per tag, so different releases never cancel each other's pending
+# runs. Other events are grouped by branch, which also folds the push and
+# pull_request runs of one branch together.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && 'xs-release-publish' || format('xs-release-{0}', github.ref) }}
+  group: xs-release-${{ inputs.tag || github.head_ref || github.ref_name }}
   cancel-in-progress: false
 
 permissions: {}
@@ -411,20 +413,20 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: trivy-*
-          path: ${{ runner.temp }}/sarif
+          path: sarif
 
       - name: Upload amd64
-        if: hashFiles('**/sarif/trivy-amd64/trivy.sarif') != ''
+        if: hashFiles('sarif/trivy-amd64/trivy.sarif') != ''
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          sarif_file: ${{ runner.temp }}/sarif/trivy-amd64/trivy.sarif
+          sarif_file: sarif/trivy-amd64/trivy.sarif
           category: trivy-amd64
 
       - name: Upload arm64
-        if: hashFiles('**/sarif/trivy-arm64/trivy.sarif') != ''
+        if: hashFiles('sarif/trivy-arm64/trivy.sarif') != ''
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          sarif_file: ${{ runner.temp }}/sarif/trivy-arm64/trivy.sarif
+          sarif_file: sarif/trivy-arm64/trivy.sarif
           category: trivy-arm64
 
   publish:

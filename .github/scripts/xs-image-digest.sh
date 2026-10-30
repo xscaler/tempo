@@ -31,15 +31,20 @@ case "$ref" in
     ;;
 esac
 
-if err="$(crane digest "$ref" 2>&1 >/dev/null)"; then
-  crane digest "$ref"
+# One lookup. Stdout is the digest on success; stderr is kept apart so
+# a log line from crane can never end up in the digest, and a failure is
+# classified from the same call without asking the registry again.
+errfile="$(mktemp)"
+trap 'rm -f "$errfile"' EXIT
+if digest="$(crane digest "$ref" 2>"$errfile")"; then
+  printf '%s\n' "$digest"
   exit 0
 fi
 
-if printf '%s' "$err" | grep -qE 'MANIFEST_UNKNOWN|NAME_UNKNOWN'; then
+if grep -qE 'MANIFEST_UNKNOWN|NAME_UNKNOWN' "$errfile"; then
   exit 0
 fi
 
 echo "::error::could not look up ${ref}:" >&2
-printf '%s\n' "$err" >&2
+cat "$errfile" >&2
 exit 1
