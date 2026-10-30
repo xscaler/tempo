@@ -278,7 +278,6 @@ jobs:
             "${REPO}@${DIGEST}" > /dev/null || fail "no valid signature from ${CERT_IDENTITY}"
           gh attestation verify "oci://${REPO}@${DIGEST}" \
             --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml" \
             --cert-identity "$CERT_IDENTITY" \
             --cert-oidc-issuer "$CERT_OIDC_ISSUER" > /dev/null || fail "no valid provenance attestation"
           manifest="$(crane manifest "${REPO}@${DIGEST}")"
@@ -671,7 +670,6 @@ jobs:
         run: |
           gh attestation verify "oci://${REPO}@${DIGEST}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml" \
             --cert-identity "$CERT_IDENTITY" \
             --cert-oidc-issuer "$CERT_OIDC_ISSUER"
 
@@ -681,7 +679,6 @@ jobs:
           for d in "$AMD64" "$ARM64"; do
             gh attestation verify "oci://${REPO}@${d}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml" \
               --cert-identity "$CERT_IDENTITY" \
               --cert-oidc-issuer "$CERT_OIDC_ISSUER" \
               --predicate-type https://spdx.dev/Document/v2.3
