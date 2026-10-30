@@ -1,9 +1,12 @@
 name: xs-weekly
 
-# Rebuilds the latest release when its published image has fixable HIGH or
-# CRITICAL vulnerabilities in OS packages. The rebuild uses the same commit, so only patched
-# base images and packages change. A new tag v<ver>-xs.<n+1> is created and
-# xs-release.yml is dispatched for it.
+# Rebuilds the latest release when that clears something. The published image
+# is scanned for fixable HIGH and CRITICAL findings. If there are any, a
+# candidate is built from the same commit (amd64, not pushed) and scanned the
+# same way. Only when the candidate's finding set is strictly smaller, with no
+# new findings, is the tag v<ver>-xs.<n+1> created on the same commit and
+# xs-release.yml dispatched for it. Otherwise the job exits 0 and lists the
+# findings that need an upstream bump in the job summary.
 
 on:
   schedule:
@@ -78,18 +81,78 @@ jobs:
             -v "${RUNNER_TEMP}/trivy-cache:/cache" \
             -v "${RUNNER_TEMP}:/out" \
             "$TRIVY_IMAGE" image --no-progress --ignore-unfixed --severity HIGH,CRITICAL \
-              --format json --output /out/trivy.json --exit-code 0 \
+              --format json --output /out/published.json --exit-code 0 \
               "${GHCR_REPO}:${VERSION}"
-          # Only OS package findings can be cleared by a rebuild. Findings in
-          # the Go binary come from vendored modules and need an upstream bump,
-          # so they are listed but do not trigger a new tag.
-          jq -r '.Results[]? | .Class as $c | .Vulnerabilities[]? | "\($c) \(.Severity) \(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"' "${RUNNER_TEMP}/trivy.json" | sort -u
-          count="$(jq '[.Results[]? | select(.Class == "os-pkgs") | .Vulnerabilities[]?] | length' "${RUNNER_TEMP}/trivy.json")"
-          echo "fixable HIGH/CRITICAL OS package findings: ${count}"
+          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+            "${RUNNER_TEMP}/published.json" > "${RUNNER_TEMP}/published.ids"
+          count="$(wc -l < "${RUNNER_TEMP}/published.ids")"
+          echo "fixable HIGH/CRITICAL findings in the published image: ${count}"
+          cat "${RUNNER_TEMP}/published.ids"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 
-      - name: Tag a rebuild and dispatch the release
+      # A rebuild only helps when it clears something. Build a candidate from
+      # the same commit without pushing it and compare finding sets.
+      - name: Check out the release commit
         if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        env:
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: git checkout --detach "refs/tags/${TAG}"
+
+      - name: Set up Go
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
+      - name: Set up Buildx
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and scan a candidate
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        id: candidate
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          COMPONENT=tempo GOARCH=amd64 make exe VERSION="v${VERSION}"
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --file cmd/tempo/Dockerfile \
+            --output "type=oci,tar=false,dest=${RUNNER_TEMP}/candidate" .
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e TRIVY_CACHE_DIR=/cache \
+            -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2" \
+            -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1" \
+            -v "${RUNNER_TEMP}/candidate:/image:ro" \
+            -v "${RUNNER_TEMP}/trivy-cache:/cache" \
+            -v "${RUNNER_TEMP}:/out" \
+            "$TRIVY_IMAGE" image --no-progress --input /image --ignore-unfixed --severity HIGH,CRITICAL \
+              --format json --output /out/candidate.json --exit-code 0
+          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+            "${RUNNER_TEMP}/candidate.json" > "${RUNNER_TEMP}/candidate.ids"
+          before="$(wc -l < "${RUNNER_TEMP}/published.ids")"
+          after="$(wc -l < "${RUNNER_TEMP}/candidate.ids")"
+          # New findings that the published image does not have.
+          added="$(LC_ALL=C comm -13 "${RUNNER_TEMP}/published.ids" "${RUNNER_TEMP}/candidate.ids" | wc -l)"
+          {
+            echo "### Weekly rescan of ${VERSION}"
+            echo "Published image: ${before} fixable HIGH/CRITICAL findings. Rebuild candidate: ${after}."
+            echo
+            echo "Findings left in the candidate (need an upstream bump):"
+            echo '```'
+            cat "${RUNNER_TEMP}/candidate.ids"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$after" -lt "$before" ] && [ "$added" -eq 0 ]; then
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "A rebuild would not clear any finding (${before} -> ${after}), no new tag"
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag a rebuild and dispatch the release
+        if: steps.candidate.outputs.rebuild == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.latest.outputs.tag }}
