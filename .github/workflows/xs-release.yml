@@ -266,29 +266,7 @@ jobs:
           DIGEST: ${{ steps.existing.outputs.digest }}
           COMMIT: ${{ steps.vars.outputs.commit }}
           CERT_IDENTITY: ${{ steps.vars.outputs.identity }}
-        run: |
-          set -euo pipefail
-          fail() {
-            echo "::error title=Untrusted image::${REPO}:${IMAGE_TAG} exists without trusted provenance: $1. Investigate, then bump -xs.n."
-            exit 1
-          }
-          cosign verify \
-            --certificate-identity "$CERT_IDENTITY" \
-            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
-            "${REPO}@${DIGEST}" > /dev/null || fail "no valid signature from ${CERT_IDENTITY}"
-          gh attestation verify "oci://${REPO}@${DIGEST}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --cert-identity "$CERT_IDENTITY" \
-            --cert-oidc-issuer "$CERT_OIDC_ISSUER" > /dev/null || fail "no valid provenance attestation"
-          manifest="$(crane manifest "${REPO}@${DIGEST}")"
-          for arch in amd64 arm64; do
-            d="$(jq -r --arg a "$arch" '.manifests[] | select(.platform.architecture == $a) | .digest' <<< "$manifest")"
-            [ -n "$d" ] || fail "no ${arch} image in the index"
-            rev="$(crane config "${REPO}@${d}" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')"
-            [ "$rev" = "$COMMIT" ] || fail "${arch} revision label is '${rev}', not ${COMMIT}"
-            echo "${arch}=${d}" >> "$GITHUB_OUTPUT"
-          done
-          echo "::notice::${REPO}:${IMAGE_TAG} at ${DIGEST} is trusted, skipping the build"
+        run: wf/.github/scripts/xs-trust-check.sh "$REPO" "$IMAGE_TAG" "$DIGEST" "$COMMIT" "$GITHUB_OUTPUT"
 
   build:
     name: Build and scan (${{ matrix.arch }})
@@ -455,7 +433,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || '' }}
+    environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || 'rehearsal' }}
     permissions:
       contents: read
       packages: write
@@ -567,8 +545,8 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      - name: Install crane
-        run: wf/.github/scripts/xs-install-tools.sh crane
+      - name: Install crane and cosign
+        run: wf/.github/scripts/xs-install-tools.sh crane cosign
 
       - name: Download images
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -605,6 +583,82 @@ jobs:
             *"version v${VERSION} "*) ;;
             *) echo "::error::image does not report v${VERSION}"; exit 1 ;;
           esac
+
+      # Negative trust tests. The trust check must reject an image that was
+      # not signed by this workflow and one built from another commit, and it
+      # must never sign anything. Positive signature and attestation checks
+      # only run against GHCR (the rehearsal rerun); here cosign is a logging
+      # shim that fails on any sign or attest call.
+      - name: Trust check rejects an unsigned image
+        if: matrix.arch == 'amd64'
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          CERT_IDENTITY: https://github.com/xscaler/tempo/.github/workflows/xs-release.yml@refs/heads/main
+          GITHUB_REPOSITORY: xscaler/tempo
+          GH_TOKEN: unused
+        run: |
+          set -uo pipefail
+          shim="${RUNNER_TEMP}/shim"
+          log="${RUNNER_TEMP}/cosign.log"
+          mkdir -p "$shim"
+          : > "$log"
+          real="$(command -v cosign)"
+          cat > "$shim/cosign" <<SHIM
+          #!/usr/bin/env bash
+          echo "\$*" >> "${log}"
+          case "\$1" in sign|attest) echo "cosign \$1 must not run" >&2; exit 99 ;; esac
+          exec "${real}" "\$@"
+          SHIM
+          chmod +x "$shim/cosign"
+          export PATH="$shim:$PATH"
+          export CERT_OIDC_ISSUER=https://token.actions.githubusercontent.com
+
+          out="$(wf/.github/scripts/xs-trust-check.sh "$REPO" "$IMAGE_TAG" "$DIGEST" "$COMMIT" /dev/null 2>&1)"
+          rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -ne 0 ] || { echo "::error::ASSERT FAILED: unsigned image was accepted"; exit 1; }
+          grep -q 'exists without trusted provenance' <<< "$out" || { echo "::error::ASSERT FAILED: no untrusted-image error"; exit 1; }
+          echo "ASSERT ok: unsigned image rejected (exit ${rc}) with 'exists without trusted provenance'"
+          grep -q '^verify ' "$log" || { echo "::error::ASSERT FAILED: cosign verify was not called"; exit 1; }
+          if grep -qE '^(sign|attest) ' "$log"; then
+            echo "::error::ASSERT FAILED: signing was attempted"
+            exit 1
+          fi
+          echo "ASSERT ok: cosign was only asked to verify, no sign or attest call"
+
+      - name: Revision check rejects another commit and accepts the right one
+        if: matrix.arch == 'amd64'
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -uo pipefail
+          # A second local tag whose revision label differs from the commit.
+          other=0000000000000000000000000000000000000000
+          crane mutate "${REPO}@${AMD64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-amd64" > /dev/null
+          crane mutate "${REPO}@${ARM64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-arm64" > /dev/null
+          docker buildx imagetools create --tag "${REPO}:other-commit" "${REPO}:other-amd64" "${REPO}:other-arm64" > /dev/null
+          bad="$(crane digest "${REPO}:other-commit")"
+
+          out="$(wf/.github/scripts/xs-check-revision.sh "$REPO" other-commit "$bad" "$COMMIT" /dev/null 2>&1)"
+          rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -ne 0 ] || { echo "::error::ASSERT FAILED: a different revision was accepted"; exit 1; }
+          grep -q 'exists without trusted provenance' <<< "$out" || { echo "::error::ASSERT FAILED: no untrusted-image error"; exit 1; }
+          grep -q "revision label is '${other}'" <<< "$out" || { echo "::error::ASSERT FAILED: wrong reason"; exit 1; }
+          echo "ASSERT ok: image with another revision label rejected (exit ${rc}) with 'exists without trusted provenance'"
+
+          good="${RUNNER_TEMP}/good.env"
+          : > "$good"
+          wf/.github/scripts/xs-check-revision.sh "$REPO" "$IMAGE_TAG" "$DIGEST" "$COMMIT" "$good"
+          if ! grep -qx "amd64=${AMD64}" "$good" || ! grep -qx "arm64=${ARM64}" "$good"; then
+            echo "::error::ASSERT FAILED: wrong arch digests"
+            exit 1
+          fi
+          echo "ASSERT ok: image built from ${COMMIT} accepted, arch digests returned"
 
   verify:
     name: Verify signatures and attestations
@@ -689,6 +743,8 @@ jobs:
   run-image:
     name: Run the published image (${{ matrix.arch }})
     needs: [prepare, verify]
+    # verify is skipped when the publish job is, so it needs its own status check.
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     permissions:
@@ -729,7 +785,7 @@ jobs:
   git-tag:
     name: Create the git tag
     needs: [prepare, run-image]
-    if: needs.prepare.outputs.mode == 'release'
+    if: ${{ !cancelled() && needs.prepare.outputs.mode == 'release' && needs.run-image.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
