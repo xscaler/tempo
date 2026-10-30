@@ -1,0 +1,301 @@
+name: xs-test
+
+# Runs upstream's own lint, unit, integration and build checks against this
+# fork. The jobs mirror .github/workflows/ci.yml and call the same make
+# targets. Upstream's ci.yml is disabled in this repo and left untouched.
+#
+# Not mirrored from ci.yml:
+#   coverage-annotations  needs a pull request diff and only decorates the PR
+#                         with uncovered lines through a Grafana-owned action
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, 'ci/**']
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: "0"
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: check-fmt
+        run: make check-fmt
+
+      - name: check-jsonnetfmt
+        run: make check-jsonnetfmt
+
+      - name: Get year and week number
+        id: get-year-week-number
+        run: echo "date=$(date +"%Yweek%U")" >> "$GITHUB_OUTPUT"
+
+      - name: cache golangci
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ steps.get-year-week-number.outputs.date }}-${{ hashFiles('go.mod', '.golangci.yml') }}
+
+      # Pull requests are linted against their base like upstream does. Other
+      # events lint the whole tree.
+      - name: lint
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            make lint "base=origin/${BASE_REF}"
+          else
+            make lint
+          fi
+          sudo chown -R "$(id -u):$(id -g)" .cache/golangci-lint  # needed to archive cache
+
+  unit-tests:
+    name: Unit tests (${{ matrix.test-target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target:
+          - test-with-cover-pkg
+          - test-with-cover-tempodb
+          - test-with-cover-tempodb-wal
+          - test-with-cover-others
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run tests
+        env:
+          TEST_TARGET: ${{ matrix.test-target }}
+        run: make "$TEST_TARGET"
+
+  integration-tests-validation:
+    name: Validate integration test coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate all integration folders are covered by CI
+        run: |
+          # Folders that have a test-e2e-* make target and a matrix entry below
+          EXPECTED_FOLDERS=("api" "limits" "metrics-generator" "operations" "storage" "util")
+
+          mapfile -d '' _raw < <(find integration/ -mindepth 1 -maxdepth 1 -type d -not -name '.*' -print0 2>/dev/null)
+          ACTUAL_FOLDERS=()
+          for _d in "${_raw[@]}"; do ACTUAL_FOLDERS+=("$(basename "$_d")"); done
+
+          EXPECTED_SORTED=$(printf '%s\n' "${EXPECTED_FOLDERS[@]}" | sort | tr '\n' ' ')
+          ACTUAL_SORTED=$(printf '%s\n' "${ACTUAL_FOLDERS[@]}" | sort | tr '\n' ' ')
+
+          if [ "$EXPECTED_SORTED" != "$ACTUAL_SORTED" ]; then
+            echo "::error::integration folders do not match the expected list"
+            echo "expected: ${EXPECTED_SORTED}"
+            echo "actual:   ${ACTUAL_SORTED}"
+            echo "Add a test-e2e-<folder> make target, a matrix entry in xs-test.yml and update EXPECTED_FOLDERS."
+            exit 1
+          fi
+          echo "All integration folders are covered by CI"
+
+  integration-tests:
+    name: Integration tests (${{ matrix.test-target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: integration-tests-validation
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target:
+          - test-e2e-operations
+          - test-e2e-api
+          - test-e2e-limits
+          - test-e2e-metrics-generator
+          - test-e2e-storage
+          - test-e2e-util
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Fetch tags
+        run: git fetch --prune --unshallow --tags
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run tests
+        env:
+          TEST_TARGET: ${{ matrix.test-target }}
+        run: make "$TEST_TARGET"
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Tempo
+        run: make tempo
+
+      - name: generate-manifest
+        run: make generate-manifest
+
+      - name: Build tempo-query
+        run: make tempo-query
+
+      - name: Build vulture
+        run: make tempo-vulture
+
+      - name: Build tempo-cli
+        run: make tempo-cli
+
+      - name: Verify packaged and example configs
+        run: make check-configs
+
+  build-riscv64:
+    name: Build (riscv64 cross-compilation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      GOARCH: riscv64
+      GOOS: linux
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Tempo
+        run: make tempo
+
+      - name: Build tempo-query
+        run: make tempo-query
+
+      - name: Build vulture
+        run: make tempo-vulture
+
+      - name: Build tempo-cli
+        run: make tempo-cli
+
+  vendor-check:
+    name: Vendor check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check vendor
+        run: make vendor-check
+
+  tempo-jsonnet:
+    name: Check jsonnet and tempo-mixin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check jsonnet
+        run: make jsonnet-check
+
+      - name: Check tempo-mixin
+        run: make tempo-mixin-check
+
+      - name: Test jsonnet
+        run: make jsonnet-test
+
+  build-technical-documentation:
+    name: Build technical documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build website
+        run: docker run -v "${PWD}/docs/sources:/hugo/content/docs/tempo/latest" --rm grafana/docs-base:latest make prod

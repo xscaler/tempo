@@ -1,0 +1,590 @@
+name: xs-release
+
+# Builds, scans, signs and publishes the tempo image.
+#
+#   push of a v*-xs.* tag   release: build, scan, push to GHCR, copy to ECR, sign, verify
+#   workflow_dispatch       release of the tag given as input
+#   pull_request            verify only
+#   push to main or ci/**,  verify only: build both arches and scan, no push, no sign
+#
+# Image tag and binary version are <upstream version>-xs.<n>, for example
+# 3.1.1-xs.0 (git tag v3.1.1-xs.0). The binary is built with upstream's
+# `make exe`, with VERSION overridden on the command line so upstream's own
+# ldflags inject the version. One build per release: the per-arch images built
+# and scanned here are the ones pushed, and ECR gets a copy of the same digest.
+#
+# Cosign identity of every signature made here:
+#   https://github.com/xscaler/tempo/.github/workflows/xs-release.yml@<ref>
+#   issuer https://token.actions.githubusercontent.com
+#
+# ECR needs the repository xscaler/tempo and the OIDC trust for this repo on
+# refs/heads/main and refs/tags/v*. Until that terraform change is applied
+# the ecr job fails with an error saying so; the GHCR release is not affected.
+
+on:
+  push:
+    branches: [main, 'ci/**']
+    tags: ['v*-xs.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish (for example v3.1.1-xs.0)'
+        type: string
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE: tempo
+  GHCR_REPO: ghcr.io/xscaler/tempo
+  ECR_REGISTRY: 483075907540.dkr.ecr.eu-west-1.amazonaws.com
+  ECR_REPO: 483075907540.dkr.ecr.eu-west-1.amazonaws.com/xscaler/tempo
+  AWS_REGION: eu-west-1
+  SOURCE_URL: https://github.com/xscaler/tempo
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  # Matches the signer workflow path and any release ref (main or a v*-xs.* tag).
+  CERT_IDENTITY_REGEXP: '^https://github\.com/xscaler/tempo/\.github/workflows/xs-release\.yml@refs/(heads/main|tags/v.+-xs\.[0-9]+)$'
+  CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      existing: ${{ steps.existing.outputs.digest }}
+      release: ${{ steps.vars.outputs.release }}
+      tag: ${{ steps.vars.outputs.tag }}
+      version: ${{ steps.vars.outputs.version }}
+      ref: ${{ steps.vars.outputs.ref }}
+    steps:
+      - name: Resolve tag and version
+        id: vars
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          fi
+
+          if [ -z "$tag" ]; then
+            # Verify mode: nothing is pushed or signed.
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "version=verify" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$ ]]; then
+            echo "::error::tag '${tag}' does not match v<upstream-version>-xs.<n>"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ steps.vars.outputs.ref }}
+          persist-credentials: false
+
+      # The upstream release version lives in VERSION. The tag must extend it,
+      # so v3.1.1-xs.0 can only be cut from a tree that is upstream 3.1.1.
+      - name: Check tag against the VERSION file
+        env:
+          RELEASE: ${{ steps.vars.outputs.release }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [ "$RELEASE" = "true" ] || exit 0
+          upstream="$(cat VERSION)"
+          case "$TAG" in
+            "v${upstream}-xs."*) echo "tag ${TAG} extends upstream ${upstream}" ;;
+            *)
+              echo "::error::tag ${TAG} does not extend the VERSION file (${upstream})"
+              exit 1
+              ;;
+          esac
+
+      # A re-run for a tag that is already in GHCR must not build a second,
+      # different digest. When the tag exists, later jobs reuse its digest.
+      - name: Set up crane
+        if: steps.vars.outputs.release == 'true'
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to GHCR
+        if: steps.vars.outputs.release == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Look for an existing image
+        id: existing
+        env:
+          RELEASE: ${{ steps.vars.outputs.release }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -uo pipefail
+          if [ "$RELEASE" != "true" ]; then
+            echo "digest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A missing package or tag counts as absent. Any other error fails.
+          if out="$(crane manifest "${GHCR_REPO}:${VERSION}" 2>&1 >/dev/null)"; then
+            digest="$(crane digest "${GHCR_REPO}:${VERSION}")"
+            echo "::notice::${GHCR_REPO}:${VERSION} already exists at ${digest}, reusing it"
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$out" | grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|not found|404|denied'; then
+            echo "${GHCR_REPO}:${VERSION} does not exist yet"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not check ${GHCR_REPO}:${VERSION}:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+  build:
+    name: Build and scan (${{ matrix.arch }})
+    needs: prepare
+    if: needs.prepare.outputs.existing == ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      RELEASE: ${{ needs.prepare.outputs.release }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Same build as upstream's docker workflow: make exe, then the stock
+      # Dockerfile. The only change is the version string passed to make.
+      - name: Build binary
+        run: |
+          if [ "$RELEASE" = "true" ]; then
+            BUILD_VERSION="v${VERSION}"
+          else
+            BUILD_VERSION="v$(cat VERSION)-xs.verify"
+          fi
+          echo "BUILD_VERSION=${BUILD_VERSION}" >> "$GITHUB_ENV"
+          COMPONENT="$IMAGE" GOARCH="$ARCH" make exe VERSION="${BUILD_VERSION}"
+
+      # An OCI layout directory keeps the exact bytes that were scanned, so the
+      # publish job can push them unchanged.
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=${SOURCE_URL}" \
+            --label "org.opencontainers.image.licenses=AGPL-3.0-only" \
+            --label "org.opencontainers.image.version=${BUILD_VERSION#v}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --file "cmd/${IMAGE}/Dockerfile" \
+            --output "type=oci,name=tempo-verify:${ARCH},tar=false,dest=${RUNNER_TEMP}/oci-${ARCH}" \
+            .
+
+      - name: Check the binary version
+        run: |
+          set -euo pipefail
+          # docker load needs a tar, so pack the layout first.
+          tar -C "${RUNNER_TEMP}/oci-${ARCH}" -cf "${RUNNER_TEMP}/oci-${ARCH}.tar" .
+          docker load -q -i "${RUNNER_TEMP}/oci-${ARCH}.tar"
+          out="$(docker run --rm "tempo-verify:${ARCH}" -version)"
+          echo "$out"
+          case "$out" in
+            *"version ${BUILD_VERSION} "*) ;;
+            *) echo "::error::binary does not report ${BUILD_VERSION}"; exit 1 ;;
+          esac
+
+      - name: Scan image with Trivy
+        run: |
+          set -euo pipefail
+          mkdir -p trivy-out "${RUNNER_TEMP}/trivy-cache"
+          trivy() {
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -e TRIVY_CACHE_DIR=/cache \
+              -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2" \
+              -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1" \
+              -v "${RUNNER_TEMP}/oci-${ARCH}:/image:ro" \
+              -v "${GITHUB_WORKSPACE}/trivy-out:/out" \
+              -v "${RUNNER_TEMP}/trivy-cache:/cache" \
+              "$TRIVY_IMAGE" image --no-progress --input /image "$@"
+          }
+          # Report: SARIF with HIGH and CRITICAL for code scanning.
+          trivy --severity HIGH,CRITICAL --format sarif --output /out/trivy.sarif --exit-code 0
+          # Report: HIGH findings in the log.
+          trivy --severity HIGH --format table --exit-code 0
+          # Gate: any fixable CRITICAL fails the build.
+          trivy --severity CRITICAL --ignore-unfixed --format table --exit-code 1
+
+      - name: Upload SARIF to code scanning
+        if: always() && github.event_name != 'pull_request' && hashFiles('trivy-out/trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-out/trivy.sarif
+          category: trivy-${{ matrix.arch }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: oci-dir:${{ runner.temp }}/oci-${{ matrix.arch }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload image and SBOM
+        if: needs.prepare.outputs.release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/oci-${{ matrix.arch }}
+            ${{ runner.temp }}/sbom-${{ matrix.arch }}.spdx.json
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Push to GHCR and sign
+    if: always() && needs.prepare.outputs.release == 'true' && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      EXISTING: ${{ needs.prepare.outputs.existing }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Download images
+        if: env.EXISTING == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Set up crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each arch image goes up by digest, so no per-arch tag is created.
+      - name: Push per-arch images by digest
+        id: arch
+        if: env.EXISTING == ''
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            dir="${RUNNER_TEMP}/images/image-${arch}/oci-${arch}"
+            digest="$(jq -r '.manifests[0].digest' "${dir}/index.json")"
+            crane push "$dir" "${GHCR_REPO}@${digest}"
+            echo "${arch}=${digest}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Create the multi-arch index
+        id: index
+        env:
+          AMD64: ${{ steps.arch.outputs.amd64 }}
+          ARM64: ${{ steps.arch.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXISTING" ]; then
+            docker buildx imagetools create \
+              --tag "${GHCR_REPO}:${VERSION}" \
+              "${GHCR_REPO}@${AMD64}" "${GHCR_REPO}@${ARM64}"
+          fi
+          # The digest always comes from the registry.
+          digest="$(crane digest "${GHCR_REPO}:${VERSION}")"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${GHCR_REPO}:${VERSION} is at ${digest}"
+
+      - name: Attest SBOM (amd64)
+        if: env.EXISTING == ''
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/xscaler/tempo
+          subject-digest: ${{ steps.arch.outputs.amd64 }}
+          sbom-path: ${{ runner.temp }}/images/image-amd64/sbom-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest SBOM (arm64)
+        if: env.EXISTING == ''
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/xscaler/tempo
+          subject-digest: ${{ steps.arch.outputs.arm64 }}
+          sbom-path: ${{ runner.temp }}/images/image-arm64/sbom-arm64.spdx.json
+          push-to-registry: true
+
+      # On a re-run the provenance attestation may already exist. Attest only
+      # when it does not.
+      - name: Check for existing provenance
+        id: prov
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        continue-on-error: true
+        run: |
+          gh attestation verify "oci://${GHCR_REPO}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml"
+
+      - name: Attest build provenance
+        if: steps.prov.outcome == 'failure'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/xscaler/tempo
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign with cosign
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: .github/scripts/xs-sign.sh "${GHCR_REPO}@${DIGEST}"
+
+  ecr:
+    name: Copy to ECR and sign
+    if: needs.prepare.outputs.release == 'true'
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Check the push role is configured
+        env:
+          ROLE_ARN: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error title=ECR push role missing::repository variable AWS_OPS_ECR_PUSH_ROLE_ARN is not set"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Explain a credentials failure
+        if: failure() && steps.aws.outcome == 'failure'
+        run: |
+          echo "::error title=ECR access failed::could not assume the ECR push role. The role trusts only repo:xscaler/tempo on refs/heads/main and refs/tags/v*. If the terraform change that creates the role and the ECR repositories has not been applied yet, this job is expected to fail. The GHCR image is already published and signed."
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Check the ECR repository exists
+        run: |
+          if ! aws ecr describe-repositories --repository-names xscaler/tempo > /dev/null; then
+            echo "::error title=ECR repository missing::repository xscaler/tempo does not exist in ${ECR_REGISTRY}. The terraform change that creates it has not been applied. The GHCR image is already published and signed."
+            exit 1
+          fi
+
+      - name: Set up crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Copies the index and both arch images blob for blob, so the digest in
+      # ECR equals the digest in GHCR. A tag that already exists must point at
+      # the same digest.
+      - name: Copy the image to ECR
+        run: |
+          set -uo pipefail
+          if out="$(crane manifest "${ECR_REPO}:${VERSION}" 2>&1 >/dev/null)"; then
+            got="$(crane digest "${ECR_REPO}:${VERSION}")"
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::ECR ${VERSION} is ${got} but GHCR is ${DIGEST}; ECR tags are immutable"
+              exit 1
+            fi
+            echo "ECR already has ${VERSION} at ${DIGEST}"
+          elif printf '%s' "$out" | grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|not found|404'; then
+            crane copy "${GHCR_REPO}@${DIGEST}" "${ECR_REPO}:${VERSION}"
+            got="$(crane digest "${ECR_REPO}:${VERSION}")"
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::ECR digest ${got} differs from GHCR digest ${DIGEST}"
+              exit 1
+            fi
+          else
+            echo "::error::could not check ECR:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+      - name: Sign with cosign
+        run: .github/scripts/xs-sign.sh "${ECR_REPO}@${DIGEST}"
+
+  verify:
+    name: Verify signatures and version
+    if: always() && needs.publish.result == 'success'
+    needs: [prepare, publish, ecr]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+      ECR_RESULT: ${{ needs.ecr.result }}
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the GHCR signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+            "${GHCR_REPO}@${DIGEST}" > /dev/null
+          echo "cosign signature verified on ${GHCR_REPO}@${DIGEST}"
+
+      - name: Verify the GHCR provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${GHCR_REPO}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml"
+
+      - name: Check the version reported by the GHCR image
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "${GHCR_REPO}@${DIGEST}" -version)"
+          echo "$out"
+          case "$out" in
+            *"version v${VERSION} "*) ;;
+            *) echo "::error::GHCR image does not report v${VERSION}"; exit 1 ;;
+          esac
+
+      - name: Configure AWS credentials
+        if: env.ECR_RESULT == 'success'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: env.ECR_RESULT == 'success'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Verify the ECR signature and version
+        if: env.ECR_RESULT == 'success'
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+            "${ECR_REPO}@${DIGEST}" > /dev/null
+          echo "cosign signature verified on ${ECR_REPO}@${DIGEST}"
+          out="$(docker run --rm "${ECR_REPO}@${DIGEST}" -version)"
+          echo "$out"
+          case "$out" in
+            *"version v${VERSION} "*) ;;
+            *) echo "::error::ECR image does not report v${VERSION}"; exit 1 ;;
+          esac
+
+      - name: Fail when the ECR copy failed
+        if: env.ECR_RESULT != 'success'
+        run: |
+          echo "::error title=ECR copy did not complete::the ecr job ended as ${ECR_RESULT}. The GHCR image is verified; the ECR copy is missing."
+          exit 1

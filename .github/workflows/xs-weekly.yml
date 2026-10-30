@@ -1,0 +1,107 @@
+name: xs-weekly
+
+# Rebuilds the latest release when its published image has fixable HIGH or
+# CRITICAL vulnerabilities in OS packages. The rebuild uses the same commit, so only patched
+# base images and packages change. A new tag v<ver>-xs.<n+1> is created and
+# xs-release.yml is dispatched for it.
+
+on:
+  schedule:
+    - cron: '43 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  GHCR_REPO: ghcr.io/xscaler/tempo
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+
+jobs:
+  rescan:
+    name: Scan latest release and rebuild if needed
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # create the next release tag
+      actions: write    # dispatch xs-release.yml
+      packages: read    # pull the image for the scan
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find the latest release tag
+        id: latest
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          tag="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$' | sort -V | tail -1)"
+          if [ -z "$tag" ]; then
+            echo "::notice::no v*-xs.* tag exists yet, nothing to scan"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Latest release tag: ${tag}"
+
+      - name: Log in to GHCR
+        if: steps.latest.outputs.found == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan the published image
+        if: steps.latest.outputs.found == 'true'
+        id: scan
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e TRIVY_CACHE_DIR=/cache \
+            -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2" \
+            -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1" \
+            -e DOCKER_CONFIG=/docker-config \
+            -v "${HOME}/.docker:/docker-config:ro" \
+            -v "${RUNNER_TEMP}/trivy-cache:/cache" \
+            -v "${RUNNER_TEMP}:/out" \
+            "$TRIVY_IMAGE" image --no-progress --ignore-unfixed --severity HIGH,CRITICAL \
+              --format json --output /out/trivy.json --exit-code 0 \
+              "${GHCR_REPO}:${VERSION}"
+          # Only OS package findings can be cleared by a rebuild. Findings in
+          # the Go binary come from vendored modules and need an upstream bump,
+          # so they are listed but do not trigger a new tag.
+          jq -r '.Results[]? | .Class as $c | .Vulnerabilities[]? | "\($c) \(.Severity) \(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"' "${RUNNER_TEMP}/trivy.json" | sort -u
+          count="$(jq '[.Results[]? | select(.Class == "os-pkgs") | .Vulnerabilities[]?] | length' "${RUNNER_TEMP}/trivy.json")"
+          echo "fixable HIGH/CRITICAL OS package findings: ${count}"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Tag a rebuild and dispatch the release
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prefix="${TAG%-xs.*}"
+          n="${TAG##*-xs.}"
+          next="${prefix}-xs.$((n + 1))"
+          sha="$(git rev-list -n 1 "$TAG")"
+          echo "Creating ${next} on ${sha}"
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${next}" -f "sha=${sha}" > /dev/null
+          gh workflow run xs-release.yml \
+            --repo "$GITHUB_REPOSITORY" --ref "$next" -f "tag=${next}"
+          echo "Dispatched xs-release.yml for ${next}"
