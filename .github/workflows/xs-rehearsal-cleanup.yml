@@ -1,0 +1,49 @@
+name: xs-rehearsal-cleanup
+
+# Deletes rehearsal image versions older than 14 days. Rehearsal images are
+# pushed to ghcr.io/xscaler/rehearsal/tempo by xs-release.yml on ci/** pushes
+# and are never used for anything else. Only that package is touched.
+
+on:
+  schedule:
+    - cron: '23 5 * * 2'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: Delete old rehearsal versions
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write    # delete package versions
+    steps:
+      - name: Delete versions older than 14 days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: xscaler
+          PACKAGE: rehearsal%2Ftempo
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          # A package that was never pushed has nothing to clean.
+          if ! err="$(gh api "orgs/${OWNER}/packages/container/${PACKAGE}" 2>&1 >/dev/null)"; then
+            if printf '%s' "$err" | grep -q 'HTTP 404'; then
+              echo "package does not exist, nothing to do"
+              exit 0
+            fi
+            printf '%s\n' "$err"
+            exit 1
+          fi
+          ids="$(gh api --paginate "orgs/${OWNER}/packages/container/${PACKAGE}/versions?per_page=100" \
+            --jq ".[] | select(.updated_at < \"${cutoff}\") | .id")"
+          for id in $ids; do
+            echo "deleting version ${id}"
+            gh api -X DELETE "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${id}"
+          done

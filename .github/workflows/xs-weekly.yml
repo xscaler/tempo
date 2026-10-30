@@ -206,10 +206,16 @@ jobs:
               --format json --output /out/candidate.json --exit-code 0
           jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
             "${RUNNER_TEMP}/out/candidate.json" > "${RUNNER_TEMP}/out/candidate.ids"
+          jq '[.Results[]? | .Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' \
+            "${RUNNER_TEMP}/out/candidate.json" > "${RUNNER_TEMP}/out/candidate.crit"
 
       - name: Use the published set as the candidate set
         if: steps.published.outputs.count == '0'
-        run: cp "${RUNNER_TEMP}/out/published.ids" "${RUNNER_TEMP}/out/candidate.ids"
+        run: |
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/out/published.ids" "${RUNNER_TEMP}/out/candidate.ids"
+          jq '[.Results[]? | .Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' \
+            "${RUNNER_TEMP}/out/published.json" > "${RUNNER_TEMP}/out/candidate.crit"
 
       - name: Upload the finding sets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -218,6 +224,7 @@ jobs:
           path: |
             ${{ runner.temp }}/out/published.ids
             ${{ runner.temp }}/out/candidate.ids
+            ${{ runner.temp }}/out/candidate.crit
           retention-days: 1
           if-no-files-found: error
 
@@ -247,6 +254,7 @@ jobs:
           cd "${RUNNER_TEMP}/ids"
           cat ids-*/published.ids | sort -u > published.all
           cat ids-*/candidate.ids | sort -u > candidate.all
+          crit="$(cat ids-*/candidate.crit | awk '{ s += $1 } END { print s + 0 }')"
           before="$(wc -l < published.all)"
           after="$(wc -l < candidate.all)"
           added="$(comm -13 published.all candidate.all | wc -l)"
@@ -261,6 +269,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$before" -eq 0 ]; then
             echo "published image is clean, nothing to do"
+            exit 0
+          fi
+          if [ "$crit" -gt 0 ]; then
+            msg="The candidate still has ${crit} fixable CRITICAL finding(s), so the release gate would fail. No rebuild dispatched."
+            echo "$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           if [ "$after" -lt "$before" ] && [ "$added" -eq 0 ]; then
