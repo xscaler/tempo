@@ -529,11 +529,12 @@ jobs:
           DIGEST: ${{ steps.index.outputs.digest }}
         run: wf/.github/scripts/xs-sign.sh "${REPO}@${DIGEST}"
 
-  # Pull request time dry run of the publish logic against a local registry.
-  # Cosign and attestations need OIDC and are skipped here.
+  # Dry run of the publish logic against a local registry, in every mode but
+  # release (so pull requests and ci/** pushes exercise it). Cosign and
+  # attestations need OIDC and are skipped here.
   dry-run:
     name: Publish dry run (${{ matrix.arch }})
-    if: needs.prepare.outputs.publish == 'false'
+    if: needs.prepare.outputs.mode != 'release'
     needs: [prepare, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
