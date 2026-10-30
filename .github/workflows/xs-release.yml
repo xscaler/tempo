@@ -598,7 +598,7 @@ jobs:
           GITHUB_REPOSITORY: xscaler/tempo
           GH_TOKEN: unused
         run: |
-          set -uo pipefail
+          set -u +e
           shim="${RUNNER_TEMP}/shim"
           log="${RUNNER_TEMP}/cosign.log"
           mkdir -p "$shim"
@@ -635,13 +635,13 @@ jobs:
           ARM64: ${{ steps.index.outputs.arm64 }}
           COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
-          set -uo pipefail
+          set -u +e
           # A second local tag whose revision label differs from the commit.
           other=0000000000000000000000000000000000000000
-          crane mutate "${REPO}@${AMD64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-amd64" > /dev/null
-          crane mutate "${REPO}@${ARM64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-arm64" > /dev/null
-          docker buildx imagetools create --tag "${REPO}:other-commit" "${REPO}:other-amd64" "${REPO}:other-arm64" > /dev/null
-          bad="$(crane digest "${REPO}:other-commit")"
+          crane mutate "${REPO}@${AMD64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-amd64" > /dev/null || exit 1
+          crane mutate "${REPO}@${ARM64}" -l "org.opencontainers.image.revision=${other}" -t "${REPO}:other-arm64" > /dev/null || exit 1
+          docker buildx imagetools create --tag "${REPO}:other-commit" "${REPO}:other-amd64" "${REPO}:other-arm64" > /dev/null || exit 1
+          bad="$(crane digest "${REPO}:other-commit")" || exit 1
 
           out="$(wf/.github/scripts/xs-check-revision.sh "$REPO" other-commit "$bad" "$COMMIT" /dev/null 2>&1)"
           rc=$?
@@ -653,7 +653,7 @@ jobs:
 
           good="${RUNNER_TEMP}/good.env"
           : > "$good"
-          wf/.github/scripts/xs-check-revision.sh "$REPO" "$IMAGE_TAG" "$DIGEST" "$COMMIT" "$good"
+          wf/.github/scripts/xs-check-revision.sh "$REPO" "$IMAGE_TAG" "$DIGEST" "$COMMIT" "$good" || exit 1
           if ! grep -qx "amd64=${AMD64}" "$good" || ! grep -qx "arm64=${ARM64}" "$good"; then
             echo "::error::ASSERT FAILED: wrong arch digests"
             exit 1
