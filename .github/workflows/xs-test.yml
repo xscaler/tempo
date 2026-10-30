@@ -58,18 +58,21 @@ jobs:
           path: .cache/golangci-lint
           key: golangci-lint-${{ runner.os }}-${{ steps.get-year-week-number.outputs.date }}-${{ hashFiles('go.mod', '.golangci.yml') }}
 
-      # Pull requests are linted against their base like upstream does. Other
-      # events lint the whole tree.
+      # Upstream lints only new code, because the tree has findings of its own.
+      # Pull requests are linted against their base. Other events are linted
+      # against the upstream release tag named by the VERSION file, so only
+      # changes made in this fork are checked.
       - name: lint
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            make lint "base=origin/${BASE_REF}"
+            base="origin/${BASE_REF}"
           else
-            make lint
+            base="v$(cat VERSION)"
           fi
+          make lint "base=${base}"
           sudo chown -R "$(id -u):$(id -g)" .cache/golangci-lint  # needed to archive cache
 
   unit-tests:

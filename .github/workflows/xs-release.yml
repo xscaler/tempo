@@ -226,16 +226,15 @@ jobs:
             --label "org.opencontainers.image.version=${BUILD_VERSION#v}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             --file "cmd/${IMAGE}/Dockerfile" \
-            --output "type=oci,name=tempo-verify:${ARCH},tar=false,dest=${RUNNER_TEMP}/oci-${ARCH}" \
+            --output "type=oci,tar=false,dest=${RUNNER_TEMP}/oci-${ARCH}" \
             .
 
+      # The Dockerfile copies this file into the image unchanged. The pushed
+      # image is checked again by the verify job.
       - name: Check the binary version
         run: |
           set -euo pipefail
-          # docker load needs a tar, so pack the layout first.
-          tar -C "${RUNNER_TEMP}/oci-${ARCH}" -cf "${RUNNER_TEMP}/oci-${ARCH}.tar" .
-          docker load -q -i "${RUNNER_TEMP}/oci-${ARCH}.tar"
-          out="$(docker run --rm "tempo-verify:${ARCH}" -version)"
+          out="$("./bin/linux/${IMAGE}-${ARCH}" -version)"
           echo "$out"
           case "$out" in
             *"version ${BUILD_VERSION} "*) ;;
