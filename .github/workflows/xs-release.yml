@@ -1,22 +1,30 @@
 name: xs-release
 
-# Builds, scans, signs and publishes the tempo image.
+# Builds, scans, signs and publishes the tempo image to GHCR.
 #
-#   push of a v*-xs.* tag   release: build, scan, push to GHCR, sign, verify
-#   workflow_dispatch       release of the tag given as input
-#   pull_request            verify only
-#   push to main or ci/**,  verify only: build both arches and scan, no push, no sign
+# Modes, chosen in the prepare job:
+#   release    push of a v*-xs.* tag, or workflow_dispatch (from main) with a tag.
+#              Publishes ghcr.io/xscaler/tempo:<upstream version>-xs.<n>.
+#   rehearsal  push to ci/**. Runs the same publish path against
+#              ghcr.io/xscaler/rehearsal/tempo:<short sha>, signed as
+#              refs/heads/<branch>. Never touches ghcr.io/xscaler/tempo.
+#   verify     pull_request and push to main. Builds both arches and scans.
+#              Nothing is pushed or signed.
 #
-# Image tag and binary version are <upstream version>-xs.<n>, for example
-# 3.1.1-xs.0 (git tag v3.1.1-xs.0). The binary is built with upstream's
-# `make exe`, with VERSION overridden on the command line so upstream's own
-# ldflags inject the version. One build per release: the per-arch images built
-# and scanned here are the ones pushed. GHCR is the only publish target.
+# The binary is built with upstream's `make exe`, with VERSION overridden on
+# the command line so upstream's own ldflags inject the version. One build per
+# release: the per-arch images built and scanned here are the ones pushed.
+#
+# Dispatch inputs: `tag` is the release tag. `commit` is optional. With a
+# commit the tag does not have to exist; the git tag is created on that commit
+# only after the image is published and verified. Without a commit the tag
+# must already exist. The commit must be an ancestor of origin/main.
+#
+# Scripts are taken from the workflow's own commit (github.sha). Only the
+# source tree being built comes from the release commit.
 #
 # Cosign identity of every signature made here:
-#   https://github.com/xscaler/tempo/.github/workflows/xs-release.yml@<ref>
-#   issuer https://token.actions.githubusercontent.com
-#
+#   https://github.com/xscaler/tempo/.github/workflows/xs-release.yml@<github.ref>
 
 on:
   push:
@@ -27,106 +35,169 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build and publish (for example v3.1.1-xs.0)'
+        description: 'Release tag to publish (for example v3.1.1-xs.0)'
         type: string
         required: true
+      commit:
+        description: 'Commit to release (40 hex characters). Empty means the existing tag.'
+        type: string
+        required: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tag }}
+  group: xs-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions: {}
 
 env:
   IMAGE: tempo
-  GHCR_REPO: ghcr.io/xscaler/tempo
   SOURCE_URL: https://github.com/xscaler/tempo
   TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
-  # Matches the signer workflow path and any release ref (main or a v*-xs.* tag).
-  CERT_IDENTITY_REGEXP: '^https://github\.com/xscaler/tempo/\.github/workflows/xs-release\.yml@refs/(heads/main|tags/v.+-xs\.[0-9]+)$'
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
   CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: read
     outputs:
-      existing: ${{ steps.existing.outputs.digest }}
-      release: ${{ steps.vars.outputs.release }}
+      mode: ${{ steps.vars.outputs.mode }}
+      publish: ${{ steps.vars.outputs.publish }}
       tag: ${{ steps.vars.outputs.tag }}
+      commit: ${{ steps.vars.outputs.commit }}
       version: ${{ steps.vars.outputs.version }}
-      ref: ${{ steps.vars.outputs.ref }}
+      repo: ${{ steps.vars.outputs.repo }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      identity: ${{ steps.vars.outputs.identity }}
+      existing: ${{ steps.existing.outputs.digest }}
     steps:
-      - name: Resolve tag and version
+      - name: Check out the workflow commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: wf
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Resolve mode, tag and commit
         id: vars
+        working-directory: wf
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+
+          mode=verify
           tag=""
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            mode=release
             tag="$INPUT_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            tag="$REF_NAME"
-          fi
-
-          if [ -z "$tag" ]; then
-            # Verify mode: nothing is pushed or signed.
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-            echo "version=verify" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$ ]]; then
-            echo "::error::tag '${tag}' does not match v<upstream-version>-xs.<n>"
-            exit 1
-          fi
-          echo "release=true" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "ref=refs/tags/${tag}" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Check out code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ steps.vars.outputs.ref }}
-          persist-credentials: false
-
-      # The upstream release version lives in VERSION. The tag must extend it,
-      # so v3.1.1-xs.0 can only be cut from a tree that is upstream 3.1.1.
-      - name: Check tag against the VERSION file
-        env:
-          RELEASE: ${{ steps.vars.outputs.release }}
-          TAG: ${{ steps.vars.outputs.tag }}
-        run: |
-          set -euo pipefail
-          [ "$RELEASE" = "true" ] || exit 0
-          upstream="$(cat VERSION)"
-          case "$TAG" in
-            "v${upstream}-xs."*) echo "tag ${TAG} extends upstream ${upstream}" ;;
-            *)
-              echo "::error::tag ${TAG} does not extend the VERSION file (${upstream})"
+            if [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::releases are dispatched from main, not ${REF}"
               exit 1
+            fi
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            mode=release
+            tag="$REF_NAME"
+          elif [ "$EVENT_NAME" = "push" ] && [[ "$REF" == refs/heads/ci/* ]]; then
+            mode=rehearsal
+          fi
+
+          commit="$SHA"
+          if [ "$mode" = "release" ]; then
+            if [[ "$tag" == *$'\n'* ]] || ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-xs\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::tag is not v<upstream-version>-xs.<n>"
+              exit 1
+            fi
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              tag_commit="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" || true)"
+              if [ -n "$INPUT_COMMIT" ]; then
+                if [[ "$INPUT_COMMIT" == *$'\n'* ]] || ! [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::error::commit must be 40 lowercase hex characters"
+                  exit 1
+                fi
+                commit="$INPUT_COMMIT"
+                if [ -n "$tag_commit" ] && [ "$tag_commit" != "$commit" ]; then
+                  echo "::error::tag ${tag} already points at ${tag_commit}, not ${commit}"
+                  exit 1
+                fi
+              elif [ -n "$tag_commit" ]; then
+                commit="$tag_commit"
+              else
+                echo "::error::tag ${tag} does not exist and no commit was given"
+                exit 1
+              fi
+            fi
+
+            git cat-file -e "${commit}^{commit}"
+            if ! git merge-base --is-ancestor "$commit" origin/main; then
+              echo "::error::commit ${commit} is not an ancestor of origin/main"
+              exit 1
+            fi
+          fi
+
+          upstream="$(git show "${commit}:VERSION")"
+          short="$(git rev-parse --short=7 "$commit")"
+          case "$mode" in
+            release)
+              case "$tag" in
+                "v${upstream}-xs."*) ;;
+                *)
+                  echo "::error::tag ${tag} does not extend the VERSION file (${upstream})"
+                  exit 1
+                  ;;
+              esac
+              version="${tag#v}"
+              repo="ghcr.io/xscaler/${IMAGE}"
+              image_tag="$version"
+              ;;
+            rehearsal)
+              version="${upstream}-xs.rehearsal.${short}"
+              repo="ghcr.io/xscaler/rehearsal/${IMAGE}"
+              image_tag="$short"
+              ;;
+            *)
+              version="${upstream}-xs.verify"
+              repo="ghcr.io/xscaler/${IMAGE}"
+              image_tag="$short"
               ;;
           esac
 
-      # A re-run for a tag that is already in GHCR must not build a second,
+          publish=false
+          if [ "$mode" != "verify" ]; then
+            publish=true
+          fi
+
+          {
+            echo "mode=${mode}"
+            echo "publish=${publish}"
+            echo "tag=${tag}"
+            echo "commit=${commit}"
+            echo "version=${version}"
+            echo "repo=${repo}"
+            echo "image_tag=${image_tag}"
+            echo "identity=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml@${REF}"
+          } >> "$GITHUB_OUTPUT"
+
+      # A re-run for an image that is already in GHCR must not build a second,
       # different digest. When the tag exists, later jobs reuse its digest.
-      - name: Set up crane
-        if: steps.vars.outputs.release == 'true'
-        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Install crane
+        if: steps.vars.outputs.publish == 'true'
+        run: wf/.github/scripts/xs-install-tools.sh crane
 
       - name: Log in to GHCR
-        if: steps.vars.outputs.release == 'true'
+        if: steps.vars.outputs.publish == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -136,27 +207,19 @@ jobs:
       - name: Look for an existing image
         id: existing
         env:
-          RELEASE: ${{ steps.vars.outputs.release }}
-          VERSION: ${{ steps.vars.outputs.version }}
+          PUBLISH: ${{ steps.vars.outputs.publish }}
+          REPO: ${{ steps.vars.outputs.repo }}
+          IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
         run: |
-          set -uo pipefail
-          if [ "$RELEASE" != "true" ]; then
-            echo "digest=" >> "$GITHUB_OUTPUT"
-            exit 0
+          set -euo pipefail
+          digest=""
+          if [ "$PUBLISH" = "true" ]; then
+            digest="$(wf/.github/scripts/xs-image-digest.sh "${REPO}:${IMAGE_TAG}")"
+            if [ -n "$digest" ]; then
+              echo "::notice::${REPO}:${IMAGE_TAG} already exists at ${digest}, reusing it"
+            fi
           fi
-          # A missing package or tag counts as absent. Any other error fails.
-          if out="$(crane manifest "${GHCR_REPO}:${VERSION}" 2>&1 >/dev/null)"; then
-            digest="$(crane digest "${GHCR_REPO}:${VERSION}")"
-            echo "::notice::${GHCR_REPO}:${VERSION} already exists at ${digest}, reusing it"
-            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          elif printf '%s' "$out" | grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|not found|404|denied'; then
-            echo "${GHCR_REPO}:${VERSION} does not exist yet"
-            echo "digest=" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::could not check ${GHCR_REPO}:${VERSION}:"
-            printf '%s\n' "$out"
-            exit 1
-          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and scan (${{ matrix.arch }})
@@ -166,7 +229,6 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -176,40 +238,60 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     env:
-      RELEASE: ${{ needs.prepare.outputs.release }}
-      VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
     steps:
-      - name: Check out code
+      - name: Check out the workflow commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.prepare.outputs.ref }}
+          ref: ${{ github.sha }}
+          path: wf
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Check out the source to build
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          path: src
           persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: 'go.mod'
+          go-version-file: src/go.mod
           cache: false
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Install syft
+        run: wf/.github/scripts/xs-install-tools.sh syft
+
+      - name: Set up buildx
+        run: docker buildx create --name xs --driver docker-container --driver-opt "image=${BUILDKIT_IMAGE}" --use
 
       # Same build as upstream's docker workflow: make exe, then the stock
       # Dockerfile. The only change is the version string passed to make.
       - name: Build binary
+        working-directory: src
+        run: COMPONENT="$IMAGE" GOARCH="$ARCH" make exe VERSION="v${VERSION}"
+
+      # The Dockerfile copies this file into the image unchanged. The pushed
+      # image is checked again by the verify job.
+      - name: Check the binary version
+        working-directory: src
         run: |
-          if [ "$RELEASE" = "true" ]; then
-            BUILD_VERSION="v${VERSION}"
-          else
-            BUILD_VERSION="v$(cat VERSION)-xs.verify"
-          fi
-          echo "BUILD_VERSION=${BUILD_VERSION}" >> "$GITHUB_ENV"
-          COMPONENT="$IMAGE" GOARCH="$ARCH" make exe VERSION="${BUILD_VERSION}"
+          set -euo pipefail
+          out="$("./bin/linux/${IMAGE}-${ARCH}" -version)"
+          echo "$out"
+          case "$out" in
+            *"version v${VERSION} "*) ;;
+            *) echo "::error::binary does not report v${VERSION}"; exit 1 ;;
+          esac
 
       # An OCI layout directory keeps the exact bytes that were scanned, so the
       # publish job can push them unchanged.
       - name: Build image
+        working-directory: src
         run: |
           set -euo pipefail
           docker buildx build \
@@ -217,35 +299,23 @@ jobs:
             --provenance=false --sbom=false \
             --label "org.opencontainers.image.source=${SOURCE_URL}" \
             --label "org.opencontainers.image.licenses=AGPL-3.0-only" \
-            --label "org.opencontainers.image.version=${BUILD_VERSION#v}" \
-            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${COMMIT}" \
             --file "cmd/${IMAGE}/Dockerfile" \
             --output "type=oci,tar=false,dest=${RUNNER_TEMP}/oci-${ARCH}" \
             .
 
-      # The Dockerfile copies this file into the image unchanged. The pushed
-      # image is checked again by the verify job.
-      - name: Check the binary version
-        run: |
-          set -euo pipefail
-          out="$("./bin/linux/${IMAGE}-${ARCH}" -version)"
-          echo "$out"
-          case "$out" in
-            *"version ${BUILD_VERSION} "*) ;;
-            *) echo "::error::binary does not report ${BUILD_VERSION}"; exit 1 ;;
-          esac
-
       - name: Scan image with Trivy
         run: |
           set -euo pipefail
-          mkdir -p trivy-out "${RUNNER_TEMP}/trivy-cache"
+          mkdir -p "${RUNNER_TEMP}/trivy-out" "${RUNNER_TEMP}/trivy-cache"
           trivy() {
             docker run --rm --user "$(id -u):$(id -g)" \
               -e TRIVY_CACHE_DIR=/cache \
               -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2" \
               -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1" \
               -v "${RUNNER_TEMP}/oci-${ARCH}:/image:ro" \
-              -v "${GITHUB_WORKSPACE}/trivy-out:/out" \
+              -v "${RUNNER_TEMP}/trivy-out:/out" \
               -v "${RUNNER_TEMP}/trivy-cache:/cache" \
               "$TRIVY_IMAGE" image --no-progress --input /image "$@"
           }
@@ -256,24 +326,20 @@ jobs:
           # Gate: any fixable CRITICAL fails the build.
           trivy --severity CRITICAL --ignore-unfixed --format table --exit-code 1
 
-      - name: Upload SARIF to code scanning
-        if: always() && github.event_name != 'pull_request' && hashFiles('trivy-out/trivy.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - name: Upload the SARIF report
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          sarif_file: trivy-out/trivy.sarif
-          category: trivy-${{ matrix.arch }}
+          name: trivy-${{ matrix.arch }}
+          path: ${{ runner.temp }}/trivy-out/trivy.sarif
+          retention-days: 1
+          if-no-files-found: warn
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: oci-dir:${{ runner.temp }}/oci-${{ matrix.arch }}
-          format: spdx-json
-          output-file: ${{ runner.temp }}/sbom-${{ matrix.arch }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Generate the SBOM
+        run: syft "oci-dir:${RUNNER_TEMP}/oci-${ARCH}" -o "spdx-json@2.3=${RUNNER_TEMP}/sbom-${ARCH}.spdx.json"
 
       - name: Upload image and SBOM
-        if: needs.prepare.outputs.release == 'true'
+        if: needs.prepare.outputs.publish == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: image-${{ matrix.arch }}
@@ -283,12 +349,45 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Code scanning upload is its own job so that pull request code never runs
+  # with security-events: write.
+  sarif:
+    name: Upload code scanning results
+    needs: [prepare, build]
+    if: always() && github.event_name != 'pull_request' && needs.build.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download the reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: trivy-*
+          path: ${{ runner.temp }}/sarif
+
+      - name: Upload amd64
+        if: hashFiles('**/sarif/trivy-amd64/trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy-amd64/trivy.sarif
+          category: trivy-amd64
+
+      - name: Upload arm64
+        if: hashFiles('**/sarif/trivy-arm64/trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy-arm64/trivy.sarif
+          category: trivy-arm64
+
   publish:
     name: Push to GHCR and sign
-    if: always() && needs.prepare.outputs.release == 'true' && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped')
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || '' }}
     permissions:
       contents: read
       packages: write
@@ -296,15 +395,31 @@ jobs:
       attestations: write
     outputs:
       digest: ${{ steps.index.outputs.digest }}
+      amd64: ${{ steps.index.outputs.amd64 }}
+      arm64: ${{ steps.index.outputs.arm64 }}
     env:
-      VERSION: ${{ needs.prepare.outputs.version }}
+      REPO: ${{ needs.prepare.outputs.repo }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
       EXISTING: ${{ needs.prepare.outputs.existing }}
+      CERT_IDENTITY: ${{ needs.prepare.outputs.identity }}
     steps:
-      - name: Check out code
+      - name: Check out the workflow commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.prepare.outputs.ref }}
+          ref: ${{ github.sha }}
+          path: wf
+          sparse-checkout: .github/scripts
           persist-credentials: false
+
+      - name: Install crane and cosign
+        run: wf/.github/scripts/xs-install-tools.sh crane cosign
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download images
         if: env.EXISTING == ''
@@ -313,58 +428,60 @@ jobs:
           pattern: image-*
           path: ${{ runner.temp }}/images
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Set up crane
-        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       # Each arch image goes up by digest, so no per-arch tag is created.
       - name: Push per-arch images by digest
-        id: arch
         if: env.EXISTING == ''
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
             dir="${RUNNER_TEMP}/images/image-${arch}/oci-${arch}"
             digest="$(jq -r '.manifests[0].digest' "${dir}/index.json")"
-            crane push "$dir" "${GHCR_REPO}@${digest}"
-            echo "${arch}=${digest}" >> "$GITHUB_OUTPUT"
+            crane push "$dir" "${REPO}@${digest}"
+            echo "${arch}=${digest}" >> "${RUNNER_TEMP}/arch.env"
           done
 
+      # The tag is checked again right before the index is created, and the
+      # index digest comes from the create command, not from reading the tag.
       - name: Create the multi-arch index
         id: index
-        env:
-          AMD64: ${{ steps.arch.outputs.amd64 }}
-          ARM64: ${{ steps.arch.outputs.arm64 }}
         run: |
           set -euo pipefail
           if [ -z "$EXISTING" ]; then
+            current="$(wf/.github/scripts/xs-image-digest.sh "${REPO}:${IMAGE_TAG}")"
+            if [ -n "$current" ]; then
+              echo "::error::${REPO}:${IMAGE_TAG} appeared during this run at ${current}"
+              exit 1
+            fi
+            # shellcheck disable=SC1091
+            . "${RUNNER_TEMP}/arch.env"
             docker buildx imagetools create \
-              --tag "${GHCR_REPO}:${VERSION}" \
-              "${GHCR_REPO}@${AMD64}" "${GHCR_REPO}@${ARM64}"
+              --metadata-file "${RUNNER_TEMP}/index-meta.json" \
+              --tag "${REPO}:${IMAGE_TAG}" \
+              "${REPO}@${amd64}" "${REPO}@${arm64}"
+            digest="$(jq -r '."containerimage.descriptor".digest' "${RUNNER_TEMP}/index-meta.json")"
+          else
+            digest="$EXISTING"
           fi
-          # The digest always comes from the registry.
-          digest="$(crane digest "${GHCR_REPO}:${VERSION}")"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "${GHCR_REPO}:${VERSION} is at ${digest}"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::no index digest"; exit 1 ;;
+          esac
+          manifest="$(crane manifest "${REPO}@${digest}")"
+          amd64="$(jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest' <<< "$manifest")"
+          arm64="$(jq -r '.manifests[] | select(.platform.architecture == "arm64") | .digest' <<< "$manifest")"
+          {
+            echo "digest=${digest}"
+            echo "amd64=${amd64}"
+            echo "arm64=${arm64}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${REPO}:${IMAGE_TAG} is ${digest} (amd64 ${amd64}, arm64 ${arm64})"
 
       - name: Attest SBOM (amd64)
         if: env.EXISTING == ''
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-name: ghcr.io/xscaler/tempo
-          subject-digest: ${{ steps.arch.outputs.amd64 }}
+          subject-name: ${{ needs.prepare.outputs.repo }}
+          subject-digest: ${{ steps.index.outputs.amd64 }}
           sbom-path: ${{ runner.temp }}/images/image-amd64/sbom-amd64.spdx.json
           push-to-registry: true
 
@@ -372,8 +489,8 @@ jobs:
         if: env.EXISTING == ''
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-name: ghcr.io/xscaler/tempo
-          subject-digest: ${{ steps.arch.outputs.arm64 }}
+          subject-name: ${{ needs.prepare.outputs.repo }}
+          subject-digest: ${{ steps.index.outputs.arm64 }}
           sbom-path: ${{ runner.temp }}/images/image-arm64/sbom-arm64.spdx.json
           push-to-registry: true
 
@@ -381,12 +498,12 @@ jobs:
       # when it does not.
       - name: Check for existing provenance
         id: prov
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.index.outputs.digest }}
-        continue-on-error: true
         run: |
-          gh attestation verify "oci://${GHCR_REPO}@${DIGEST}" \
+          gh attestation verify "oci://${REPO}@${DIGEST}" \
             --repo "${GITHUB_REPOSITORY}" \
             --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml"
 
@@ -394,17 +511,17 @@ jobs:
         if: steps.prov.outcome == 'failure'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/xscaler/tempo
+          subject-name: ${{ needs.prepare.outputs.repo }}
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
 
       - name: Sign with cosign
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
-        run: .github/scripts/xs-sign.sh "${GHCR_REPO}@${DIGEST}"
+        run: wf/.github/scripts/xs-sign.sh "${REPO}@${DIGEST}"
 
   verify:
-    name: Verify signatures and version
+    name: Verify signatures and attestations
     needs: [prepare, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -413,11 +530,24 @@ jobs:
       packages: read
       attestations: read
     env:
+      REPO: ${{ needs.prepare.outputs.repo }}
       VERSION: ${{ needs.prepare.outputs.version }}
       DIGEST: ${{ needs.publish.outputs.digest }}
+      AMD64: ${{ needs.publish.outputs.amd64 }}
+      ARM64: ${{ needs.publish.outputs.arm64 }}
+      CERT_IDENTITY: ${{ needs.prepare.outputs.identity }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Check out the workflow commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: wf
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        run: wf/.github/scripts/xs-install-tools.sh cosign
 
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -426,28 +556,73 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify the GHCR signature
+      - name: Verify the cosign signatures
         run: |
-          cosign verify \
-            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
-            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
-            "${GHCR_REPO}@${DIGEST}" > /dev/null
-          echo "cosign signature verified on ${GHCR_REPO}@${DIGEST}"
+          set -euo pipefail
+          for d in "$DIGEST" "$AMD64" "$ARM64"; do
+            cosign verify \
+              --certificate-identity "$CERT_IDENTITY" \
+              --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+              "${REPO}@${d}" > /dev/null
+            echo "cosign signature verified on ${REPO}@${d}"
+          done
 
-      - name: Verify the GHCR provenance attestation
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify the provenance attestation
         run: |
-          gh attestation verify "oci://${GHCR_REPO}@${DIGEST}" \
+          gh attestation verify "oci://${REPO}@${DIGEST}" \
             --repo "${GITHUB_REPOSITORY}" \
             --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml"
 
-      - name: Check the version reported by the GHCR image
+      - name: Verify the SBOM attestations
         run: |
           set -euo pipefail
-          out="$(docker run --rm "${GHCR_REPO}@${DIGEST}" -version)"
+          for d in "$AMD64" "$ARM64"; do
+            gh attestation verify "oci://${REPO}@${d}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/xs-release.yml" \
+              --predicate-type https://spdx.dev/Document/v2.3
+          done
+
+      - name: Check the version reported by the image
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "${REPO}@${DIGEST}" -version)"
           echo "$out"
           case "$out" in
             *"version v${VERSION} "*) ;;
-            *) echo "::error::GHCR image does not report v${VERSION}"; exit 1 ;;
+            *) echo "::error::image does not report v${VERSION}"; exit 1 ;;
           esac
+
+  # The git tag is created last, so a failed release leaves no tag behind.
+  git-tag:
+    name: Create the git tag
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.mode == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Create the tag when it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null)"; then
+            obj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.type)"
+            if [ "$obj" = "tag" ]; then
+              existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${existing}" --jq .object.sha)"
+            fi
+            if [ "$existing" != "$COMMIT" ]; then
+              echo "::error::tag ${TAG} points at ${existing}, not ${COMMIT}"
+              exit 1
+            fi
+            echo "tag ${TAG} already points at ${COMMIT}"
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${TAG}" -f "sha=${COMMIT}" > /dev/null
+          echo "created ${TAG} on ${COMMIT}"

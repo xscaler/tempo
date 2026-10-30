@@ -1,12 +1,17 @@
 name: xs-weekly
 
-# Rebuilds the latest release when that clears something. The published image
-# is scanned for fixable HIGH and CRITICAL findings. If there are any, a
-# candidate is built from the same commit (amd64, not pushed) and scanned the
-# same way. Only when the candidate's finding set is strictly smaller, with no
-# new findings, is the tag v<ver>-xs.<n+1> created on the same commit and
-# xs-release.yml dispatched for it. Otherwise the job exits 0 and lists the
-# findings that need an upstream bump in the job summary.
+# GitHub disables scheduled workflows after 60 days without repository
+# activity. The upstream sync (A2) keeps this repository active, so this
+# schedule keeps running.
+#
+# Rebuilds the latest published release when that clears something. The
+# published image is scanned on both platforms for fixable HIGH and CRITICAL
+# findings. If there are any, a candidate is built from the same commit on
+# both platforms (not pushed) and scanned the same way. Only when the
+# candidate's finding set is strictly smaller, with nothing new, is
+# xs-release.yml dispatched with the next tag and the same commit. The release
+# workflow creates the git tag after the image is published. Otherwise the job
+# exits 0 and lists the findings that need an upstream bump in the job summary.
 
 on:
   schedule:
@@ -20,44 +25,116 @@ concurrency:
 permissions: {}
 
 env:
+  IMAGE: tempo
   GHCR_REPO: ghcr.io/xscaler/tempo
+  LC_ALL: C
   TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
 
 jobs:
-  rescan:
-    name: Scan latest release and rebuild if needed
+  select:
+    name: Find the latest release
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
-      contents: write   # create the next release tag
-      actions: write    # dispatch xs-release.yml
-      packages: read    # pull the image for the scan
+      contents: read
+      packages: read    # check which tags exist in GHCR
+    outputs:
+      found: ${{ steps.pick.outputs.found }}
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      commit: ${{ steps.pick.outputs.commit }}
+      next_tag: ${{ steps.pick.outputs.next_tag }}
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
-      - name: Find the latest release tag
-        id: latest
+      - name: Install crane
+        run: .github/scripts/xs-install-tools.sh crane
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release tags only: upstream pre-release versions never match.
+      # Highest first by upstream version, then by the numeric -xs.<n>.
+      - name: Pick the highest tag that has an image
+        id: pick
         run: |
           set -euo pipefail
-          git fetch --tags --force
-          tag="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$' | sort -V | tail -1)"
-          if [ -z "$tag" ]; then
-            echo "::notice::no v*-xs.* tag exists yet, nothing to scan"
+          re='^v[0-9]+\.[0-9]+\.[0-9]+-xs\.(0|[1-9][0-9]*)$'
+          tags="$(git tag --list 'v*-xs.*' | while read -r t; do
+            if [[ "$t" =~ $re ]]; then echo "$t"; fi
+          done)"
+          # Sort key: upstream version (V), then the number after -xs. (numeric).
+          sorted="$(printf '%s\n' "$tags" | awk -F'-xs[.]' 'NF == 2 { print substr($1, 2) " " $2 " " $0 }' | sort -k1,1V -k2,2n | awk '{ print $3 }' | tac)"
+
+          chosen=""
+          for t in $sorted; do
+            digest="$(.github/scripts/xs-image-digest.sh "${GHCR_REPO}:${t#v}")"
+            if [ -n "$digest" ]; then
+              chosen="$t"
+              break
+            fi
+            echo "no image for ${t}, skipping"
+          done
+
+          if [ -z "$chosen" ]; then
+            echo "::notice::no release tag with a published image yet"
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "found=true" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "Latest release tag: ${tag}"
+
+          prefix="${chosen%-xs.*}"
+          max="$(printf '%s\n' "$sorted" | awk -F'-xs[.]' -v p="$prefix" '$1 == p { print $2 }' | sort -n | tail -1)"
+          {
+            echo "found=true"
+            echo "tag=${chosen}"
+            echo "version=${chosen#v}"
+            echo "commit=$(git rev-list -n 1 "refs/tags/${chosen}")"
+            echo "next_tag=${prefix}-xs.$((max + 1))"
+          } >> "$GITHUB_OUTPUT"
+          echo "Latest release with an image: ${chosen}, next tag ${prefix}-xs.$((max + 1))"
+
+  scan:
+    name: Scan and build candidate (${{ matrix.arch }})
+    needs: select
+    if: needs.select.outputs.found == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read    # pull the published image for the scan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.select.outputs.version }}
+    steps:
+      - name: Check out the workflow commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: wf
+          sparse-checkout: .github/scripts
+          persist-credentials: false
 
       - name: Log in to GHCR
-        if: steps.latest.outputs.found == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -65,13 +142,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan the published image
-        if: steps.latest.outputs.found == 'true'
-        id: scan
-        env:
-          VERSION: ${{ steps.latest.outputs.version }}
+        id: published
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          mkdir -p "${RUNNER_TEMP}/trivy-cache" "${RUNNER_TEMP}/out"
           docker run --rm --user "$(id -u):$(id -g)" \
             -e TRIVY_CACHE_DIR=/cache \
             -e TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2" \
@@ -79,46 +153,47 @@ jobs:
             -e DOCKER_CONFIG=/docker-config \
             -v "${HOME}/.docker:/docker-config:ro" \
             -v "${RUNNER_TEMP}/trivy-cache:/cache" \
-            -v "${RUNNER_TEMP}:/out" \
-            "$TRIVY_IMAGE" image --no-progress --ignore-unfixed --severity HIGH,CRITICAL \
+            -v "${RUNNER_TEMP}/out:/out" \
+            "$TRIVY_IMAGE" image --no-progress --platform "linux/${ARCH}" \
+              --ignore-unfixed --severity HIGH,CRITICAL \
               --format json --output /out/published.json --exit-code 0 \
               "${GHCR_REPO}:${VERSION}"
           jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
-            "${RUNNER_TEMP}/published.json" > "${RUNNER_TEMP}/published.ids"
-          count="$(wc -l < "${RUNNER_TEMP}/published.ids")"
-          echo "fixable HIGH/CRITICAL findings in the published image: ${count}"
-          cat "${RUNNER_TEMP}/published.ids"
+            "${RUNNER_TEMP}/out/published.json" > "${RUNNER_TEMP}/out/published.ids"
+          count="$(wc -l < "${RUNNER_TEMP}/out/published.ids")"
+          echo "fixable HIGH/CRITICAL findings in the published ${ARCH} image: ${count}"
+          cat "${RUNNER_TEMP}/out/published.ids"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 
-      # A rebuild only helps when it clears something. Build a candidate from
-      # the same commit without pushing it and compare finding sets.
+      # A platform with nothing to fix has nothing to gain from a rebuild, so
+      # its candidate set is the published set.
       - name: Check out the release commit
-        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
-        env:
-          TAG: ${{ steps.latest.outputs.tag }}
-        run: git checkout --detach "refs/tags/${TAG}"
+        if: steps.published.outputs.count != '0'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.select.outputs.commit }}
+          path: src
+          persist-credentials: false
 
       - name: Set up Go
-        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        if: steps.published.outputs.count != '0'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: 'go.mod'
+          go-version-file: src/go.mod
           cache: false
 
-      - name: Set up Buildx
-        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up buildx
+        if: steps.published.outputs.count != '0'
+        run: docker buildx create --name xs --driver docker-container --driver-opt "image=${BUILDKIT_IMAGE}" --use
 
-      - name: Build and scan a candidate
-        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
-        id: candidate
-        env:
-          VERSION: ${{ steps.latest.outputs.version }}
+      - name: Build and scan the candidate
+        if: steps.published.outputs.count != '0'
+        working-directory: src
         run: |
           set -euo pipefail
-          COMPONENT=tempo GOARCH=amd64 make exe VERSION="v${VERSION}"
-          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-            --file cmd/tempo/Dockerfile \
+          COMPONENT="$IMAGE" GOARCH="$ARCH" make exe VERSION="v${VERSION}"
+          docker buildx build --platform "linux/${ARCH}" --provenance=false --sbom=false \
+            --file "cmd/${IMAGE}/Dockerfile" \
             --output "type=oci,tar=false,dest=${RUNNER_TEMP}/candidate" .
           docker run --rm --user "$(id -u):$(id -g)" \
             -e TRIVY_CACHE_DIR=/cache \
@@ -126,45 +201,72 @@ jobs:
             -e TRIVY_JAVA_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1" \
             -v "${RUNNER_TEMP}/candidate:/image:ro" \
             -v "${RUNNER_TEMP}/trivy-cache:/cache" \
-            -v "${RUNNER_TEMP}:/out" \
+            -v "${RUNNER_TEMP}/out:/out" \
             "$TRIVY_IMAGE" image --no-progress --input /image --ignore-unfixed --severity HIGH,CRITICAL \
               --format json --output /out/candidate.json --exit-code 0
           jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
-            "${RUNNER_TEMP}/candidate.json" > "${RUNNER_TEMP}/candidate.ids"
-          before="$(wc -l < "${RUNNER_TEMP}/published.ids")"
-          after="$(wc -l < "${RUNNER_TEMP}/candidate.ids")"
-          # New findings that the published image does not have.
-          added="$(LC_ALL=C comm -13 "${RUNNER_TEMP}/published.ids" "${RUNNER_TEMP}/candidate.ids" | wc -l)"
+            "${RUNNER_TEMP}/out/candidate.json" > "${RUNNER_TEMP}/out/candidate.ids"
+
+      - name: Use the published set as the candidate set
+        if: steps.published.outputs.count == '0'
+        run: cp "${RUNNER_TEMP}/out/published.ids" "${RUNNER_TEMP}/out/candidate.ids"
+
+      - name: Upload the finding sets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ids-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/out/published.ids
+            ${{ runner.temp }}/out/candidate.ids
+          retention-days: 1
+          if-no-files-found: error
+
+  decide:
+    name: Decide on a rebuild
+    needs: [select, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write    # dispatch xs-release.yml
+    steps:
+      - name: Download the finding sets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: ids-*
+          path: ${{ runner.temp }}/ids
+
+      - name: Compare and dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.select.outputs.tag }}
+          NEXT_TAG: ${{ needs.select.outputs.next_tag }}
+          COMMIT: ${{ needs.select.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/ids"
+          cat ids-*/published.ids | sort -u > published.all
+          cat ids-*/candidate.ids | sort -u > candidate.all
+          before="$(wc -l < published.all)"
+          after="$(wc -l < candidate.all)"
+          added="$(comm -13 published.all candidate.all | wc -l)"
           {
-            echo "### Weekly rescan of ${VERSION}"
-            echo "Published image: ${before} fixable HIGH/CRITICAL findings. Rebuild candidate: ${after}."
+            echo "### Weekly rescan of ${TAG}"
+            echo "Published image: ${before} fixable HIGH/CRITICAL findings across amd64 and arm64. Rebuild candidate: ${after}."
             echo
             echo "Findings left in the candidate (need an upstream bump):"
             echo '```'
-            cat "${RUNNER_TEMP}/candidate.ids"
+            cat candidate.all
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$before" -eq 0 ]; then
+            echo "published image is clean, nothing to do"
+            exit 0
+          fi
           if [ "$after" -lt "$before" ] && [ "$added" -eq 0 ]; then
-            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "Rebuild clears findings (${before} -> ${after}), dispatching ${NEXT_TAG}"
+            gh workflow run xs-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f "tag=${NEXT_TAG}" -f "commit=${COMMIT}"
           else
             echo "A rebuild would not clear any finding (${before} -> ${after}), no new tag"
-            echo "rebuild=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Tag a rebuild and dispatch the release
-        if: steps.candidate.outputs.rebuild == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.latest.outputs.tag }}
-        run: |
-          set -euo pipefail
-          prefix="${TAG%-xs.*}"
-          n="${TAG##*-xs.}"
-          next="${prefix}-xs.$((n + 1))"
-          sha="$(git rev-list -n 1 "$TAG")"
-          echo "Creating ${next} on ${sha}"
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${next}" -f "sha=${sha}" > /dev/null
-          gh workflow run xs-release.yml \
-            --repo "$GITHUB_REPOSITORY" --ref "$next" -f "tag=${next}"
-          echo "Dispatched xs-release.yml for ${next}"

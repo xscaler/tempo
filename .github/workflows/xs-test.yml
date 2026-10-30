@@ -301,4 +301,4 @@ jobs:
           persist-credentials: false
 
       - name: Build website
-        run: docker run -v "${PWD}/docs/sources:/hugo/content/docs/tempo/latest" --rm grafana/docs-base:latest make prod
+        run: docker run -v "${PWD}/docs/sources:/hugo/content/docs/tempo/latest" --rm grafana/docs-base@sha256:359eb0d09bbd3a9ff7077fd6ce6227dd0e0f3ce1629ce0530c6565f8c34b16ec make prod

@@ -1,40 +1,52 @@
 #!/usr/bin/env bash
-# Idempotent cosign keyless signing for a digest-pinned image reference.
+# Idempotent cosign keyless signing of a multi-arch image.
 #
-#   xs-sign.sh <repo>@<digest>
+#   xs-sign.sh <repo>@<index-digest>
 #
-# Verifies first. Signs only when the registry answers that there are no
-# signatures. Any other verify failure (identity mismatch, auth, network)
-# fails the script, so a transient error never turns into a second signature
-# and a wrong signer is never papered over. Expects CERT_IDENTITY_REGEXP and
-# CERT_OIDC_ISSUER in the environment.
+# Each of the index and its per-arch manifests is verified against the exact
+# workflow identity first and signed only when the registry reports
+# "no signatures found". Every other verify failure, including a signature
+# from a different identity, fails the script. Expects CERT_IDENTITY and
+# CERT_OIDC_ISSUER in the environment, plus crane and cosign in PATH.
 set -uo pipefail
 
-ref="${1:?usage: xs-sign.sh <repo>@<digest>}"
+ref="${1:?usage: xs-sign.sh <repo>@<index-digest>}"
+repo="${ref%@*}"
 
+# Only stderr is wanted: cosign prints the verified payload on stdout.
 verify() {
+  # shellcheck disable=SC2069
   cosign verify \
-    --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+    --certificate-identity "$CERT_IDENTITY" \
     --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
-    "$ref" 2>&1 >/dev/null
+    "$1" 2>&1 >/dev/null
 }
 
-if out="$(verify)"; then
-  echo "already signed and verified: ${ref}"
-  exit 0
-fi
+ensure_signed() { # <ref> [cosign sign flags]
+  local target="$1" out
+  shift
+  if out="$(verify "$target")"; then
+    echo "signed: ${target}"
+    return 0
+  fi
+  if ! printf '%s' "$out" | grep -q 'no signatures found'; then
+    echo "::error::cosign verify failed for ${target}:"
+    printf '%s\n' "$out"
+    return 1
+  fi
+  echo "signing ${target}"
+  cosign sign --yes "$@" "$target" || return 1
+  if ! out="$(verify "$target")"; then
+    echo "::error::signature on ${target} does not verify after signing:"
+    printf '%s\n' "$out"
+    return 1
+  fi
+  echo "signed: ${target}"
+}
 
-if ! printf '%s' "$out" | grep -qiE 'no signatures found|no matching signatures'; then
-  echo "::error::cosign verify failed for ${ref} for a reason other than a missing signature:"
-  printf '%s\n' "$out"
-  exit 1
-fi
+ensure_signed "$ref" --recursive || exit 1
 
-echo "no signature on ${ref}, signing"
-cosign sign --yes "$ref" || exit 1
-if ! out="$(verify)"; then
-  echo "::error::signature on ${ref} does not verify after signing:"
-  printf '%s\n' "$out"
-  exit 1
-fi
-echo "signed and verified: ${ref}"
+children="$(crane manifest "$ref" | jq -r '.manifests[].digest')" || exit 1
+for child in $children; do
+  ensure_signed "${repo}@${child}" || exit 1
+done
