@@ -2,7 +2,7 @@ name: xs-release
 
 # Builds, scans, signs and publishes the tempo image.
 #
-#   push of a v*-xs.* tag   release: build, scan, push to GHCR, copy to ECR, sign, verify
+#   push of a v*-xs.* tag   release: build, scan, push to GHCR, sign, verify
 #   workflow_dispatch       release of the tag given as input
 #   pull_request            verify only
 #   push to main or ci/**,  verify only: build both arches and scan, no push, no sign
@@ -11,15 +11,12 @@ name: xs-release
 # 3.1.1-xs.0 (git tag v3.1.1-xs.0). The binary is built with upstream's
 # `make exe`, with VERSION overridden on the command line so upstream's own
 # ldflags inject the version. One build per release: the per-arch images built
-# and scanned here are the ones pushed, and ECR gets a copy of the same digest.
+# and scanned here are the ones pushed. GHCR is the only publish target.
 #
 # Cosign identity of every signature made here:
 #   https://github.com/xscaler/tempo/.github/workflows/xs-release.yml@<ref>
 #   issuer https://token.actions.githubusercontent.com
 #
-# ECR needs the repository xscaler/tempo and the OIDC trust for this repo on
-# refs/heads/main and refs/tags/v*. Until that terraform change is applied
-# the ecr job fails with an error saying so; the GHCR release is not affected.
 
 on:
   push:
@@ -43,9 +40,6 @@ permissions: {}
 env:
   IMAGE: tempo
   GHCR_REPO: ghcr.io/xscaler/tempo
-  ECR_REGISTRY: 483075907540.dkr.ecr.eu-west-1.amazonaws.com
-  ECR_REPO: 483075907540.dkr.ecr.eu-west-1.amazonaws.com/xscaler/tempo
-  AWS_REGION: eu-west-1
   SOURCE_URL: https://github.com/xscaler/tempo
   TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
   # Matches the signer workflow path and any release ref (main or a v*-xs.* tag).
@@ -409,115 +403,18 @@ jobs:
           DIGEST: ${{ steps.index.outputs.digest }}
         run: .github/scripts/xs-sign.sh "${GHCR_REPO}@${DIGEST}"
 
-  ecr:
-    name: Copy to ECR and sign
-    if: needs.prepare.outputs.release == 'true'
-    needs: [prepare, publish]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      DIGEST: ${{ needs.publish.outputs.digest }}
-    steps:
-      - name: Check out code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.ref }}
-          persist-credentials: false
-
-      - name: Check the push role is configured
-        env:
-          ROLE_ARN: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
-        run: |
-          if [ -z "$ROLE_ARN" ]; then
-            echo "::error title=ECR push role missing::repository variable AWS_OPS_ECR_PUSH_ROLE_ARN is not set"
-            exit 1
-          fi
-
-      - name: Configure AWS credentials
-        id: aws
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Explain a credentials failure
-        if: failure() && steps.aws.outcome == 'failure'
-        run: |
-          echo "::error title=ECR access failed::could not assume the ECR push role. The role trusts only repo:xscaler/tempo on refs/heads/main and refs/tags/v*. If the terraform change that creates the role and the ECR repositories has not been applied yet, this job is expected to fail. The GHCR image is already published and signed."
-
-      - name: Log in to ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
-
-      - name: Check the ECR repository exists
-        run: |
-          if ! aws ecr describe-repositories --repository-names xscaler/tempo > /dev/null; then
-            echo "::error title=ECR repository missing::repository xscaler/tempo does not exist in ${ECR_REGISTRY}. The terraform change that creates it has not been applied. The GHCR image is already published and signed."
-            exit 1
-          fi
-
-      - name: Set up crane
-        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Copies the index and both arch images blob for blob, so the digest in
-      # ECR equals the digest in GHCR. A tag that already exists must point at
-      # the same digest.
-      - name: Copy the image to ECR
-        run: |
-          set -uo pipefail
-          if out="$(crane manifest "${ECR_REPO}:${VERSION}" 2>&1 >/dev/null)"; then
-            got="$(crane digest "${ECR_REPO}:${VERSION}")"
-            if [ "$got" != "$DIGEST" ]; then
-              echo "::error::ECR ${VERSION} is ${got} but GHCR is ${DIGEST}; ECR tags are immutable"
-              exit 1
-            fi
-            echo "ECR already has ${VERSION} at ${DIGEST}"
-          elif printf '%s' "$out" | grep -qiE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|not found|404'; then
-            crane copy "${GHCR_REPO}@${DIGEST}" "${ECR_REPO}:${VERSION}"
-            got="$(crane digest "${ECR_REPO}:${VERSION}")"
-            if [ "$got" != "$DIGEST" ]; then
-              echo "::error::ECR digest ${got} differs from GHCR digest ${DIGEST}"
-              exit 1
-            fi
-          else
-            echo "::error::could not check ECR:"
-            printf '%s\n' "$out"
-            exit 1
-          fi
-
-      - name: Sign with cosign
-        run: .github/scripts/xs-sign.sh "${ECR_REPO}@${DIGEST}"
-
   verify:
     name: Verify signatures and version
-    if: always() && needs.publish.result == 'success'
-    needs: [prepare, publish, ecr]
+    needs: [prepare, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
       packages: read
-      id-token: write
       attestations: read
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       DIGEST: ${{ needs.publish.outputs.digest }}
-      ECR_RESULT: ${{ needs.ecr.result }}
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -554,36 +451,3 @@ jobs:
             *"version v${VERSION} "*) ;;
             *) echo "::error::GHCR image does not report v${VERSION}"; exit 1 ;;
           esac
-
-      - name: Configure AWS credentials
-        if: env.ECR_RESULT == 'success'
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Log in to ECR
-        if: env.ECR_RESULT == 'success'
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
-
-      - name: Verify the ECR signature and version
-        if: env.ECR_RESULT == 'success'
-        run: |
-          set -euo pipefail
-          cosign verify \
-            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
-            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
-            "${ECR_REPO}@${DIGEST}" > /dev/null
-          echo "cosign signature verified on ${ECR_REPO}@${DIGEST}"
-          out="$(docker run --rm "${ECR_REPO}@${DIGEST}" -version)"
-          echo "$out"
-          case "$out" in
-            *"version v${VERSION} "*) ;;
-            *) echo "::error::ECR image does not report v${VERSION}"; exit 1 ;;
-          esac
-
-      - name: Fail when the ECR copy failed
-        if: env.ECR_RESULT != 'success'
-        run: |
-          echo "::error title=ECR copy did not complete::the ecr job ended as ${ECR_RESULT}. The GHCR image is verified; the ECR copy is missing."
-          exit 1
