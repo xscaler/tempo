@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs release tools pinned by version and sha256.
 #
-#   xs-install-tools.sh crane cosign syft
+#   xs-install-tools.sh crane cosign syft shellcheck
 #
 # Binaries go to $RUNNER_TEMP/xs-bin, which is added to GITHUB_PATH. A download
 # whose sha256 does not match the pin fails the job. To bump a tool, change the
@@ -12,6 +12,7 @@ set -euo pipefail
 CRANE_VERSION=0.22.1
 COSIGN_VERSION=3.1.4
 SYFT_VERSION=1.55.0
+SHELLCHECK_VERSION=0.9.0
 
 case "$(uname -m)" in
   x86_64) arch=amd64 ;;
@@ -26,6 +27,8 @@ declare -A SUMS=(
   [cosign-arm64]=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
   [syft-amd64]=bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d
   [syft-arm64]=929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304
+  [shellcheck-amd64]=700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f
+  [shellcheck-arm64]=179c579ef3481317d130adebede74a34dbbc2df961a70916dd4039ebf0735fae
 )
 
 bin="${RUNNER_TEMP:?}/xs-bin"
@@ -55,6 +58,12 @@ for tool in "$@"; do
     syft)
       fetch "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_${arch}.tar.gz" "$work/syft.tgz" "$sum"
       tar -xzf "$work/syft.tgz" -C "$bin" syft
+      ;;
+    shellcheck)
+      case "$arch" in amd64) a=x86_64 ;; arm64) a=aarch64 ;; esac
+      fetch "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${a}.tar.xz" "$work/shellcheck.txz" "$sum"
+      tar -xJf "$work/shellcheck.txz" -C "$work" "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+      install -m 0755 "$work/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$bin/shellcheck"
       ;;
     *)
       echo "unknown tool ${tool}" >&2

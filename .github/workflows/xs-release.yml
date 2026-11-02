@@ -45,7 +45,11 @@ name: xs-release
 
 on:
   push:
-    branches: ['**']
+    # rehearsal-sync/** branches are written by the xs-sync rehearsal with an App
+    # token, which (unlike GITHUB_TOKEN) triggers workflows; skip them.
+    branches-ignore:
+      - 'rehearsal-sync/**'
+      - 'sync/**' # sync PRs run on the pull_request event only
     tags: ['v*-xs.*']
   pull_request:
     branches: [main]
@@ -62,9 +66,10 @@ on:
 
 # One group per ref and tag, so different releases never cancel each other's
 # pending runs, and a dispatch from another branch cannot displace a pending
-# release from main. Pull request runs are grouped by their head branch.
+# release from main. Pull request runs are grouped by event, head repository
+# and head branch.
 concurrency:
-  group: xs-release-${{ github.head_ref || github.ref }}-${{ inputs.tag || github.ref_name }}
+  group: xs-release-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions: {}

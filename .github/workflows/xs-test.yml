@@ -12,20 +12,25 @@ name: xs-test
 #   coverage artifact upload  only feeds coverage-annotations
 #
 # A pull request from a branch of this repo triggers both push and
-# pull_request; the concurrency group is keyed on the branch so one cancels
-# the other.
+# pull_request. The concurrency group names the event and the head repository,
+# so a fork PR that reuses a branch name, or a push next to its pull request,
+# never cancels another run.
 
 on:
   pull_request:
     branches: [main]
   push:
-    branches: ['**']
+    # rehearsal-sync/** branches are written by the xs-sync rehearsal with an App
+    # token, which (unlike GITHUB_TOKEN) triggers workflows; skip them.
+    branches-ignore:
+      - 'rehearsal-sync/**'
+      - 'sync/**' # sync PRs run on the pull_request event only
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * 1'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions: {}

@@ -1,0 +1,347 @@
+# xScaler fork: keep main within one release of upstream.
+#
+# Live runs (schedule, or workflow_dispatch on main):
+#   mirror      push upstream branches (as upstream/<name>) and new upstream tags to
+#               origin. Never pushes main, never touches v*-xs.* tags.
+#   detect      current = highest upstream release tag in main's history, latest =
+#               highest stable upstream tag. Proceeds when latest is newer and no
+#               sync PR for it is open.
+#   sync        closes stale sync/* PRs, applies our patch set to the new tag and
+#               opens a PR from sync/<tag>. The merge commit is created through the
+#               git data API, so GitHub signs it (Verified) and no job pushes with
+#               git. A patch that does not apply opens a "sync: <tag> conflicts" issue.
+#   report      opens or updates a "sync: failed" issue when a job fails.
+#
+# Rehearsal runs (push to ci/**): the mirror prints what it would push, and the
+# sync logic runs against an artificial base (an older release plus our patch set,
+# written to a dangling commit): the clean run must reproduce this branch's tree
+# exactly on a rehearsal-sync/ branch, the conflict run must open an issue (labelled
+# rehearsal, closed afterwards) and no branch. Both clean up after themselves.
+#
+# The logic lives in .github/scripts/xs-sync.sh. Its parameter block is the only
+# part that changes between repositories; this file is repository neutral.
+#
+# Upstream workflows: a sync brings new upstream workflow files, and GitHub may run
+# them once on the sync/<tag> branch push before the daily disable-upstream-workflows
+# job (which disables every active workflow that is not xs-*.yml) catches them. The
+# PR body lists every upstream .github path that changed so a reviewer sees them.
+#
+# An open sync PR is refreshed each day when main moved (rebuilt onto the new main
+# head) as long as its branch is still the bot's own commit; otherwise the PR gets
+# a comment asking for a manual update. A sync PR closed without merging is skipped.
+#
+# Sync PRs must be merged with a merge commit: main keeps the upstream tag in its
+# history, and detect, xs-release and the next sync all find the release through it.
+name: xs-sync
+
+on:
+  schedule:
+    - cron: "52 4 * * *"
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "ci/**"
+
+permissions: {}
+
+concurrency:
+  group: xs-sync-${{ github.ref == 'refs/heads/main' && 'live' || format('rehearsal-{0}', github.ref_name) }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Resolve mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          mode=none
+          if [[ ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") && "${REF}" == "refs/heads/main" ]]; then
+            mode=live
+          elif [[ ("${EVENT_NAME}" == "push" || "${EVENT_NAME}" == "workflow_dispatch") && "${REF}" == refs/heads/ci/* ]]; then
+            mode=rehearsal
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+          echo "mode: ${mode} (${EVENT_NAME} on ${REF})"
+
+  mirror:
+    name: mirror upstream
+    needs: plan
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write # upstream branches and tags carry workflow files
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Mirror
+        env:
+          XS_PUSH_TOKEN: ${{ steps.app.outputs.token }}
+        run: .github/scripts/xs-sync.sh mirror
+
+  disable-upstream-workflows:
+    name: disable upstream workflows
+    needs: plan
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-actions: write # disable workflows
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Disable every active workflow that is not xs-*.yml
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: .github/scripts/xs-sync.sh disable-upstream-workflows
+
+  mirror-dry-run:
+    name: mirror dry run
+    needs: plan
+    if: needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Print what would be pushed
+        run: .github/scripts/xs-sync.sh mirror --dry-run
+
+  detect:
+    name: detect new release
+    needs: [plan, mirror]
+    # Runs after a failed mirror too: detect reads origin's tags as they are, and a
+    # transient mirror failure must not stop a release that is already mirrored.
+    if: ${{ !cancelled() && needs.plan.outputs.mode == 'live' && (needs.mirror.result == 'success' || needs.mirror.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read # list open sync PRs
+    outputs:
+      current: ${{ steps.detect.outputs.current }}
+      latest: ${{ steps.detect.outputs.latest }}
+      proceed: ${{ steps.detect.outputs.proceed }}
+      open_pr: ${{ steps.detect.outputs.open_pr }}
+      supersede: ${{ steps.detect.outputs.supersede }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Detect
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          heads="${RUNNER_TEMP}/open-heads"
+          .github/scripts/xs-sync.sh open-heads "${heads}"
+          .github/scripts/xs-sync.sh detect --base origin/main --open-heads "${heads}"
+
+  sync:
+    name: build sync PR
+    needs: [plan, detect]
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (needs.detect.outputs.proceed == 'true' || needs.detect.outputs.open_pr == 'true' || needs.detect.outputs.supersede != '')
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write # sync/* branch and merge commit
+          permission-workflows: write # the patch set carries workflow files
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Close superseded sync PRs
+        if: needs.detect.outputs.supersede != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+          SUPERSEDE: ${{ needs.detect.outputs.supersede }}
+        run: |
+          set -euo pipefail
+          read -r -a heads <<<"${SUPERSEDE}"
+          .github/scripts/xs-sync.sh supersede "${LATEST}" "${heads[@]}"
+
+      - name: Build and open the sync PR
+        if: needs.detect.outputs.proceed == 'true' || needs.detect.outputs.open_pr == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CURRENT: ${{ needs.detect.outputs.current }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          base_commit="$(git rev-parse origin/main)"
+          base_tree="$(git rev-parse "origin/main^{tree}")"
+          .github/scripts/xs-sync.sh build --current "${CURRENT}" --latest "${LATEST}" \
+            --base-commit "${base_commit}" --base-tree "${base_tree}"
+
+  rehearsal:
+    name: rehearsal ${{ matrix.kind }}
+    needs: plan
+    if: needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [clean, merge, conflict]
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write # rehearsal-sync/* branch
+          permission-workflows: write
+          permission-issues: write # conflict issue, labelled rehearsal
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Rehearse
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          KIND: ${{ matrix.kind }}
+        run: .github/scripts/xs-sync.sh rehearse "${KIND}"
+
+  report:
+    name: report failure
+    needs: [plan, disable-upstream-workflows, mirror, detect, sync]
+    if: failure() && needs.plan.outputs.mode == 'live'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write # failure issue
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: .github/scripts/xs-sync.sh issue-failed "${RUN_URL}"
