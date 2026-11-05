@@ -160,6 +160,7 @@ type runtimeConfigOverridesManager struct {
 
 	defaultLimits    *Overrides
 	runtimeConfigMgr *runtimeconfig.Manager
+	adminStore       *adminStoreSource // nil unless the xscaler admin store is enabled
 
 	// Manager for subservices
 	subservices        *services.Manager
@@ -167,6 +168,13 @@ type runtimeConfigOverridesManager struct {
 }
 
 var _ Interface = (*runtimeConfigOverridesManager)(nil)
+
+func (o *runtimeConfigOverridesManager) waitAdminStoreApplied(ctx context.Context) error {
+	if o.adminStore == nil {
+		return nil
+	}
+	return o.adminStore.waitApplied(ctx)
+}
 
 func newRuntimeConfigOverrides(cfg Config, validator Validator, registerer prometheus.Registerer) (Service, error) {
 	var manager *runtimeconfig.Manager
@@ -177,6 +185,9 @@ func newRuntimeConfigOverrides(cfg Config, validator Validator, registerer prome
 			LoadPath:     []string{cfg.PerTenantOverrideConfig},
 			ReloadPeriod: time.Duration(cfg.PerTenantOverridePeriod),
 			Loader:       loadPerTenantOverrides(validator, cfg.ConfigType, cfg.ExpandEnv, cfg.EnableLegacyOverrides),
+		}
+		if cfg.XscalerAdminStore.Enabled {
+			runtimeCfg.Loader = warnIgnoredTenantOverrides(runtimeCfg.Loader)
 		}
 		runtimeCfgMgr, err := runtimeconfig.New(runtimeCfg, "overrides", prometheus.WrapRegistererWithPrefix("tempo_", registerer), log.Logger)
 		if err != nil {
@@ -189,6 +200,18 @@ func newRuntimeConfigOverrides(cfg Config, validator Validator, registerer prome
 	o := &runtimeConfigOverridesManager{
 		runtimeConfigMgr: manager,
 		defaultLimits:    &cfg.Defaults,
+	}
+
+	if cfg.XscalerAdminStore.Enabled {
+		bucket, err := newAdminStoreBucket(&cfg.XscalerAdminStore)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create admin store bucket: %w", err)
+		}
+		o.adminStore, err = newAdminStoreSource(cfg.XscalerAdminStore, &cfg.Defaults, validator, bucket, log.Logger, registerer)
+		if err != nil {
+			return nil, err
+		}
+		subservices = append(subservices, o.adminStore)
 	}
 
 	if len(subservices) > 0 {
@@ -260,6 +283,9 @@ func (o *runtimeConfigOverridesManager) WriteStatusRuntimeConfig(w io.Writer, r 
 	if o.tenantOverrides() != nil {
 		tenantOverrides = *o.tenantOverrides()
 	}
+	if o.adminStore != nil {
+		tenantOverrides = perTenantOverrides{TenantLimits: o.adminStore.tenants()}
+	}
 	var output interface{}
 	cfg := statusRuntimeConfig{
 		Defaults:           o.defaultLimits,
@@ -315,13 +341,38 @@ func (o *runtimeConfigOverridesManager) WriteStatusRuntimeConfig(w io.Writer, r 
 	return nil
 }
 
+// tenantLimits returns the per-tenant overrides in effect. With the admin store enabled it is the
+// only source, the runtime config tenant entries are ignored.
+func (o *runtimeConfigOverridesManager) tenantLimits() map[string]*Overrides {
+	if o.adminStore != nil {
+		return o.adminStore.tenants()
+	}
+	if tenantOverrides := o.tenantOverrides(); tenantOverrides != nil {
+		return tenantOverrides.TenantLimits
+	}
+	return nil
+}
+
+// warnIgnoredTenantOverrides logs once per reload when the runtime config carries per-tenant
+// entries (the wildcard included) that the admin store makes ineffective.
+func warnIgnoredTenantOverrides(loader runtimeconfig.Loader) runtimeconfig.Loader {
+	return func(r io.Reader) (interface{}, error) {
+		v, err := loader(r)
+		if err != nil {
+			return v, err
+		}
+		if p, ok := v.(*perTenantOverrides); ok && len(p.TenantLimits) > 0 {
+			level.Warn(log.Logger).Log("msg", "xscaler admin store is enabled, per-tenant entries in the runtime config are ignored", "tenants", len(p.TenantLimits))
+		}
+		return v, err
+	}
+}
+
 func (o *runtimeConfigOverridesManager) GetTenantIDs() []string {
-	tenantOverrides := o.tenantOverrides()
-	if tenantOverrides == nil {
+	limits := o.tenantLimits()
+	if limits == nil {
 		return nil
 	}
-
-	limits := tenantOverrides.TenantLimits
 	return slices.AppendSeq(make([]string, 0, len(limits)), maps.Keys(limits))
 }
 
@@ -712,6 +763,13 @@ func (o *runtimeConfigOverridesManager) DedicatedColumns(userID string) backend.
 }
 
 func (o *runtimeConfigOverridesManager) getOverridesForUser(userID string) *Overrides {
+	if o.adminStore != nil {
+		if l := o.adminStore.forUser(userID); l != nil {
+			return l
+		}
+		return o.defaultLimits
+	}
+
 	if tenantOverrides := o.tenantOverrides(); tenantOverrides != nil {
 		l := tenantOverrides.forUser(userID)
 		if l != nil {
@@ -732,12 +790,7 @@ func (o *runtimeConfigOverridesManager) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (o *runtimeConfigOverridesManager) Collect(ch chan<- prometheus.Metric) {
-	overrides := o.tenantOverrides()
-	if overrides == nil {
-		return
-	}
-
-	for tenant, limits := range overrides.TenantLimits {
+	for tenant, limits := range o.tenantLimits() {
 		ch <- prometheus.MustNewConstMetric(metricOverridesLimitsDesc, prometheus.GaugeValue, float64(limits.Ingestion.MaxLocalTracesPerUser), MetricMaxLocalTracesPerUser, tenant)
 		ch <- prometheus.MustNewConstMetric(metricOverridesLimitsDesc, prometheus.GaugeValue, float64(limits.Ingestion.MaxGlobalTracesPerUser), MetricMaxGlobalTracesPerUser, tenant)
 		ch <- prometheus.MustNewConstMetric(metricOverridesLimitsDesc, prometheus.GaugeValue, float64(limits.Ingestion.RateLimitBytes), MetricIngestionRateLimitBytes, tenant)

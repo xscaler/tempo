@@ -326,6 +326,9 @@ type Config struct {
 	// to the new format. This option will be removed in a future release.
 	EnableLegacyOverrides bool `yaml:"enable_legacy_overrides" json:"enable_legacy_overrides"`
 
+	// XscalerAdminStore reads per-tenant overrides from the xscaler admin store. Disabled by default.
+	XscalerAdminStore AdminStoreConfig `yaml:"xscaler_admin_store" json:"xscaler_admin_store"`
+
 	ConfigType ConfigType `yaml:"-" json:"-"`
 	ExpandEnv  bool       `yaml:"-" json:"-"`
 }
@@ -358,6 +361,8 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		UserConfigurableOverridesConfig UserConfigurableOverridesConfig `yaml:"user_configurable_overrides"`
 
 		EnableLegacyOverrides bool `yaml:"enable_legacy_overrides"`
+
+		XscalerAdminStore AdminStoreConfig `yaml:"xscaler_admin_store"`
 	}
 	var legacyCfg legacyConfig
 	legacyCfg.DefaultOverrides = c.Defaults.toLegacy()
@@ -365,6 +370,7 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	legacyCfg.PerTenantOverridePeriod = c.PerTenantOverridePeriod
 	legacyCfg.UserConfigurableOverridesConfig = c.UserConfigurableOverridesConfig
 	legacyCfg.EnableLegacyOverrides = c.EnableLegacyOverrides
+	legacyCfg.XscalerAdminStore = c.XscalerAdminStore
 
 	if legacyErr := unmarshal(&legacyCfg); legacyErr != nil {
 		return fmt.Errorf("failed to unmarshal config: %w; also failed in legacy format: %w", err, legacyErr)
@@ -381,6 +387,7 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	c.PerTenantOverridePeriod = legacyCfg.PerTenantOverridePeriod
 	c.UserConfigurableOverridesConfig = legacyCfg.UserConfigurableOverridesConfig
 	c.EnableLegacyOverrides = legacyCfg.EnableLegacyOverrides
+	c.XscalerAdminStore = legacyCfg.XscalerAdminStore
 	c.ConfigType = ConfigTypeLegacy
 	return nil
 }
@@ -420,6 +427,7 @@ func (c *Config) RegisterFlagsAndApplyDefaults(f *flag.FlagSet) {
 	f.BoolVar(&c.EnableLegacyOverrides, "config.enable-legacy-overrides", false, "Enable the deprecated legacy overrides format. This is disabled by default and will be removed in a future release.")
 
 	c.UserConfigurableOverridesConfig.RegisterFlagsAndApplyDefaults(f)
+	c.XscalerAdminStore.RegisterFlagsAndApplyDefaults(f)
 }
 
 func (c *Config) Describe(ch chan<- *prometheus.Desc) {

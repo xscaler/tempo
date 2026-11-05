@@ -115,6 +115,10 @@ func newUserConfigOverrides(cfg *UserConfigurableOverridesConfig, subOverrides S
 	return &mgr, nil
 }
 
+func (o *userConfigurableOverridesManager) waitAdminStoreApplied(ctx context.Context) error {
+	return WaitAdminStoreApplied(ctx, o.Interface)
+}
+
 func (o *userConfigurableOverridesManager) starting(ctx context.Context) error {
 	if err := services.StartManagerAndAwaitHealthy(ctx, o.subservices); err != nil {
 		return fmt.Errorf("unable to start overrides subservices: %w", err)

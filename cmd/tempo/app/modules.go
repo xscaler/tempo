@@ -207,7 +207,7 @@ func (t *App) initOverrides() (services.Service, error) {
 
 	prometheus.MustRegister(&t.cfg.Overrides)
 
-	if t.cfg.Overrides.PerTenantOverrideConfig != "" {
+	if t.cfg.Overrides.PerTenantOverrideConfig != "" || t.cfg.Overrides.XscalerAdminStore.Enabled {
 		prometheus.MustRegister(t.Overrides)
 	}
 

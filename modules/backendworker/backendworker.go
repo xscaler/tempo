@@ -137,6 +137,12 @@ func (w *BackendWorker) starting(ctx context.Context) (err error) {
 		}
 	}()
 
+	// Block retention is planned from the overrides, so wait for the admin store before joining
+	// the ring or taking jobs.
+	if err := overrides.WaitAdminStoreApplied(ctx, w.overrides); err != nil {
+		return err
+	}
+
 	if w.isSharded() {
 		w.subservices, err = services.NewManager(w.ringLifecycler, w.Ring)
 		if err != nil {
