@@ -836,6 +836,75 @@ overrides:
         api:
             check_for_conflicting_runtime_overrides: false
     enable_legacy_overrides: false
+    xscaler_admin_store:
+        enabled: false
+        cache_dir: ""
+        poll_interval: 5s
+        startup_wait: 30s
+        backend: ""
+        local:
+            path: ""
+        gcs:
+            bucket_name: ""
+            prefix: ""
+            chunk_buffer_size: 10485760
+            endpoint: ""
+            hedge_requests_at: 0s
+            hedge_requests_up_to: 2
+            insecure: false
+            object_cache_control: ""
+            object_metadata: {}
+            list_blocks_concurrency: 3
+            max_retries: 3
+        s3:
+            tls_cert_path: ""
+            tls_key_path: ""
+            tls_ca_path: ""
+            tls_server_name: ""
+            tls_insecure_skip_verify: false
+            tls_cipher_suites: ""
+            tls_min_version: VersionTLS12
+            bucket: ""
+            prefix: ""
+            endpoint: ""
+            region: ""
+            access_key: ""
+            secret_key: ""
+            session_token: ""
+            insecure: false
+            part_size: 0
+            hedge_requests_at: 0s
+            hedge_requests_up_to: 2
+            retry_max_attempts: 10
+            retry_backoff_initial: 200ms
+            retry_backoff_max: 1s
+            signature_v2: false
+            forcepathstyle: false
+            enable_dual_stack: false
+            bucket_lookup_type: 0
+            tags: {}
+            storage_class: ""
+            metadata: {}
+            native_aws_auth_enabled: false
+            list_blocks_concurrency: 3
+            sse:
+                type: ""
+                kms_key_id: ""
+                kms_encryption_context: ""
+                encryption_key: ""
+        azure:
+            storage_account_name: ""
+            storage_account_key: ""
+            use_managed_identity: false
+            use_federated_token: false
+            user_assigned_id: ""
+            container_name: ""
+            prefix: ""
+            endpoint_suffix: blob.core.windows.net
+            max_buffers: 4
+            buffer_size: 3145728
+            hedge_requests_at: 0s
+            hedge_requests_up_to: 2
 memberlist:
     node_name: ""
     randomize_node_name: true

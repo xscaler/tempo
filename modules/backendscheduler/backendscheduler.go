@@ -133,6 +133,12 @@ func New(cfg Config, store storage.Store, overrides overrides.Interface, reader 
 func (s *BackendScheduler) starting(ctx context.Context) error {
 	level.Info(log.Logger).Log("msg", "backend scheduler starting")
 
+	// Block retention is planned from the overrides, so wait for the admin store before any
+	// provider starts.
+	if err := overrides.WaitAdminStoreApplied(ctx, s.overrides); err != nil {
+		return err
+	}
+
 	if s.cfg.Poll {
 		s.store.EnablePolling(ctx, blocklist.OwnsNothingSharder, true)
 	}

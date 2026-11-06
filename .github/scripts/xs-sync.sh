@@ -53,10 +53,25 @@ XS_TAG_FORMAT="${XS_TAG_FORMAT:-v%s}"
 # Upstream branches to mirror as origin/upstream/<name>.
 XS_BRANCH_REGEX="${XS_BRANCH_REGEX:-^(main|release-v?[0-9]+(\\.[0-9]+)*(\\.x)?)\$}"
 # Paths that may differ from the upstream release tag (our patch set), as
-# shell globs matched against the full path ("*" also matches "/").
+# shell globs matched against the full path ("*" also matches "/"). Besides the
+# xs-* workflows and scripts, this carries the admin store patch: the files it
+# edits, the adminstore*.go files we own, and the vendored xscaler modules.
 XS_PATCH_PATHS=(
   ".github/workflows/xs-*"
   ".github/scripts/xs-*"
+  "cmd/tempo/app/modules.go"
+  "go.mod"
+  "go.sum"
+  "modules/backendscheduler/backendscheduler.go"
+  "modules/backendworker/backendworker.go"
+  "modules/overrides/adminstore*.go"
+  "modules/overrides/config.go"
+  "modules/overrides/runtime_config_overrides.go"
+  "docs/sources/tempo/configuration/manifest.md"
+  "modules/frontend/docs/config-reference.md"
+  "modules/overrides/user_configurable_overrides.go"
+  "vendor/modules.txt"
+  "vendor/github.com/xscaler/*"
 )
 # The namespace upstream must never own: paths that only this fork may carry.
 # Shell globs like XS_PATCH_PATHS, but workflows, scripts and actions only (not

@@ -1660,6 +1660,9 @@ github.com/uber/jaeger-lib/metrics/prometheus
 # github.com/x448/float16 v0.8.4
 ## explicit; go 1.11
 github.com/x448/float16
+# github.com/xscaler/dskit/xstenant v0.1.0
+## explicit; go 1.26.10
+github.com/xscaler/dskit/xstenant
 # github.com/yosida95/uritemplate/v3 v3.0.2
 ## explicit; go 1.14
 github.com/yosida95/uritemplate/v3
