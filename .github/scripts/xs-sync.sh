@@ -67,6 +67,8 @@ XS_PATCH_PATHS=(
   "modules/overrides/adminstore*.go"
   "modules/overrides/config.go"
   "modules/overrides/runtime_config_overrides.go"
+  "docs/sources/tempo/configuration/manifest.md"
+  "modules/frontend/docs/config-reference.md"
   "modules/overrides/user_configurable_overrides.go"
   "vendor/modules.txt"
   "vendor/github.com/xscaler/*"

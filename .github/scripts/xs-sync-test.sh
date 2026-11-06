@@ -100,7 +100,7 @@ xs_ver_gt 2.9.20 3.0.0 && r=yes || r=no
 expect "gt major" "no" "${r}"
 
 # patch path rules
-for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod modules/overrides/adminstore_bucket.go vendor/modules.txt vendor/github.com/xscaler/dskit/xstenant/source.go; do
+for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod docs/sources/tempo/configuration/manifest.md modules/frontend/docs/config-reference.md modules/overrides/adminstore_bucket.go vendor/modules.txt vendor/github.com/xscaler/dskit/xstenant/source.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "allowed ${p}" "yes" "${r}"
 done
