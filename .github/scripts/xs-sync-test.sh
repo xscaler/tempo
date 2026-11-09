@@ -100,11 +100,11 @@ xs_ver_gt 2.9.20 3.0.0 && r=yes || r=no
 expect "gt major" "no" "${r}"
 
 # patch path rules
-for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod docs/sources/tempo/configuration/manifest.md modules/frontend/docs/config-reference.md modules/overrides/adminstore_bucket.go modules/overrides/adminstore_gate.go modules/distributor/distributor.go modules/distributor/adminstore_gate_test.go vendor/modules.txt vendor/github.com/xscaler/dskit/xstenant/source.go; do
+for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod docs/sources/tempo/configuration/manifest.md modules/frontend/docs/config-reference.md modules/overrides/adminstore_bucket.go modules/overrides/adminstore_gate.go modules/distributor/distributor.go modules/distributor/adminstore_gate_test.go cmd/tempo/app/modules.go cmd/tempo/app/adminstore_auth.go cmd/tempo/app/adminstore_auth_test.go modules/distributor/receiver/shim.go modules/distributor/receiver/adminstore_auth.go modules/distributor/receiver/adminstore_auth_test.go modules/overrides/adminstore_auth.go modules/overrides/adminstore_auth_test.go vendor/modules.txt vendor/github.com/xscaler/dskit/xstenant/source.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "allowed ${p}" "yes" "${r}"
 done
-for p in .github/workflows/check.yml .github/scripts/other.sh pkg/loki/loki.go modules/distributor/receiver/shim.go modules/overrides/interface.go vendor/github.com/other/x.go vendor/github.com/xscalerx/y.go; do
+for p in .github/workflows/check.yml .github/scripts/other.sh pkg/loki/loki.go modules/distributor/receiver/middleware.go cmd/tempo/app/app.go modules/overrides/interface.go vendor/github.com/other/x.go vendor/github.com/xscalerx/y.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "not allowed ${p}" "no" "${r}"
 done

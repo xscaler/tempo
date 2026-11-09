@@ -483,7 +483,8 @@ func (t *App) initQueryFrontend() (services.Service, error) {
 	tempopb.RegisterStreamingQuerierServer(t.Server.GRPC(), queryFrontend)
 
 	httpAPIMiddleware := []middleware.Interface{
-		t.HTTPAuthMiddleware,
+		// the routes below are the client facing API: authorize the API key before the tenant is read
+		withAPIKeyAuth(t.Overrides, t.cfg.HTTPAPIPrefix, t.HTTPAuthMiddleware),
 		httpGzipMiddleware(),
 	}
 

@@ -46,6 +46,7 @@ import (
 	"github.com/grafana/tempo/pkg/util"
 	tempo_log "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
+	"github.com/xscaler/dskit/xstenant"
 )
 
 const (
@@ -360,7 +361,10 @@ func New(
 		cfgReceivers = defaultReceivers
 	}
 
-	receivers, err := receiver.New(cfgReceivers, d, middleware, cfg.RetryAfterOnResourceExhausted, loggingLevel, reg)
+	receivers, err := receiver.New(cfgReceivers, d, middleware, cfg.RetryAfterOnResourceExhausted, loggingLevel, reg,
+		receiver.WithOTLPAuthorizer(func(req xstenant.AuthRequest) xstenant.AuthDecision {
+			return overrides.CheckAuth(d.overrides, req)
+		}))
 	if err != nil {
 		return nil, err
 	}

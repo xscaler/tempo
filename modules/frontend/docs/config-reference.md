@@ -838,6 +838,7 @@ overrides:
         poll_interval: 5s
         startup_wait: 30s
         enforce_state: "off"
+        enforce_auth: "off"
         backend: ""
         local:
             path: ""

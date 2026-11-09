@@ -162,7 +162,12 @@ func (m *mapProvider) Scheme() string { return "mock" }
 
 func (m *mapProvider) Shutdown(context.Context) error { return nil }
 
-func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Middleware, retryAfterDuration time.Duration, logLevel dslog.Level, reg prometheus.Registerer) (services.Service, error) {
+func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Middleware, retryAfterDuration time.Duration, logLevel dslog.Level, reg prometheus.Registerer, opts ...Option) (services.Service, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	shim := &receiversShim{
 		pusher: pusher,
 		logger: log.NewRateLimitedLogger(logsPerSecond, level.Error(log.Logger)),
@@ -295,7 +300,12 @@ func New(receiverCfg map[string]interface{}, pusher TracesPusher, middleware Mid
 			ID:                component.NewIDWithName(componentID.Type(), fmt.Sprintf("%s_receiver", componentID.Type().String())),
 			TelemetrySettings: telemetrySettings,
 		}
-		receiver, err := factoryBase.CreateTraces(ctx, params, cfg, middleware.Wrap(shim))
+		next := middleware.Wrap(shim)
+		if componentID.Type().String() == "otlp" && o.otlpAuth != nil {
+			// authorize before the tenant is extracted
+			next = (&authMiddleware{check: o.otlpAuth}).Wrap(next)
+		}
+		receiver, err := factoryBase.CreateTraces(ctx, params, cfg, next)
 		if err != nil {
 			return nil, err
 		}

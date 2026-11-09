@@ -26,6 +26,10 @@ type AdminStoreConfig struct {
 	// EnforceState selects the push gate: off, shadow or on. With on, the distributor rejects
 	// pushes from tenants whose published state is soft_locked. Shadow only counts them.
 	EnforceState string `yaml:"enforce_state" json:"enforce_state"`
+	// EnforceAuth selects API key authorization on external entry points: off, shadow or on. With
+	// on, requests without a valid key for the tenant are rejected and the key's tenant replaces
+	// the tenant header. Shadow only counts what would be denied.
+	EnforceAuth string `yaml:"enforce_auth" json:"enforce_auth"`
 
 	Backend string        `yaml:"backend" json:"backend"`
 	Local   *local.Config `yaml:"local" json:"local"`
@@ -41,6 +45,7 @@ func (c *AdminStoreConfig) RegisterFlagsAndApplyDefaults(f *flag.FlagSet) {
 	f.DurationVar(&c.PollInterval, util.PrefixConfig(prefix, "poll-interval"), 5*time.Second, "How often to poll the admin store manifest.")
 	f.DurationVar(&c.StartupWait, util.PrefixConfig(prefix, "startup-wait"), 30*time.Second, "How long to wait for the first admin store snapshot at startup before continuing with the default overrides. Must be positive. Components that delete blocks (backend-worker, backend-scheduler) wait without a timeout. In single-binary mode, where these run in the same process as the other modules, /ready stays not ready until the first snapshot is applied while the other modules keep serving.")
 	f.StringVar(&c.EnforceState, util.PrefixConfig(prefix, "enforce-state"), xstenant.EnforceOff.String(), "Push gate for tenants soft locked by billing: off, shadow (count only) or on (reject pushes with RESOURCE_EXHAUSTED).")
+	f.StringVar(&c.EnforceAuth, util.PrefixConfig(prefix, "enforce-auth"), xstenant.EnforceOff.String(), "API key authorization of trace pushes (OTLP receivers) and the query API: off, shadow (count only) or on (reject requests without a valid key and use the key's tenant).")
 	f.StringVar(&c.Backend, util.PrefixConfig(prefix, "backend"), "", "Backend of the admin store bucket: local, gcs, s3 or azure.")
 
 	c.Azure = &azure.Config{}
@@ -88,6 +93,10 @@ func (c *AdminStoreConfig) validate() error {
 
 	if _, err := xstenant.ParseEnforceMode(c.EnforceState); c.EnforceState != "" && err != nil {
 		return fmt.Errorf("xscaler_admin_store: enforce_state: %w", err)
+	}
+
+	if _, err := xstenant.ParseEnforceMode(c.EnforceAuth); c.EnforceAuth != "" && err != nil {
+		return fmt.Errorf("xscaler_admin_store: enforce_auth: %w", err)
 	}
 
 	switch c.Backend {
