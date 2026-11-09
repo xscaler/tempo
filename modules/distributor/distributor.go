@@ -484,6 +484,12 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		return &tempopb.PushResponse{}, nil
 	}
 
+	// billing soft lock: deny the push before any limit is charged
+	if deny, reason := overrides.CheckPush(d.overrides, userID); deny {
+		overrides.RecordDiscardedSpans(spanCount, reason, userID)
+		return nil, status.Errorf(codes.ResourceExhausted, "%s: pushes are blocked for tenant %s (%s)", overrides.ErrorPrefixRateLimited, userID, reason)
+	}
+
 	// check limits
 	// todo - usage tracker include discarded bytes?
 	err = d.checkForRateLimits(size, spanCount, userID)

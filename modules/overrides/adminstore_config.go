@@ -23,6 +23,9 @@ type AdminStoreConfig struct {
 	CacheDir     string        `yaml:"cache_dir" json:"cache_dir"`
 	PollInterval time.Duration `yaml:"poll_interval" json:"poll_interval"`
 	StartupWait  time.Duration `yaml:"startup_wait" json:"startup_wait"`
+	// EnforceState selects the push gate: off, shadow or on. With on, the distributor rejects
+	// pushes from tenants whose published state is soft_locked. Shadow only counts them.
+	EnforceState string `yaml:"enforce_state" json:"enforce_state"`
 
 	Backend string        `yaml:"backend" json:"backend"`
 	Local   *local.Config `yaml:"local" json:"local"`
@@ -37,6 +40,7 @@ func (c *AdminStoreConfig) RegisterFlagsAndApplyDefaults(f *flag.FlagSet) {
 	f.StringVar(&c.CacheDir, util.PrefixConfig(prefix, "cache-dir"), "", "Directory that keeps the last applied admin store generation across restarts.")
 	f.DurationVar(&c.PollInterval, util.PrefixConfig(prefix, "poll-interval"), 5*time.Second, "How often to poll the admin store manifest.")
 	f.DurationVar(&c.StartupWait, util.PrefixConfig(prefix, "startup-wait"), 30*time.Second, "How long to wait for the first admin store snapshot at startup before continuing with the default overrides. Must be positive. Components that delete blocks (backend-worker, backend-scheduler) wait without a timeout. In single-binary mode, where these run in the same process as the other modules, /ready stays not ready until the first snapshot is applied while the other modules keep serving.")
+	f.StringVar(&c.EnforceState, util.PrefixConfig(prefix, "enforce-state"), xstenant.EnforceOff.String(), "Push gate for tenants soft locked by billing: off, shadow (count only) or on (reject pushes with RESOURCE_EXHAUSTED).")
 	f.StringVar(&c.Backend, util.PrefixConfig(prefix, "backend"), "", "Backend of the admin store bucket: local, gcs, s3 or azure.")
 
 	c.Azure = &azure.Config{}
@@ -80,6 +84,10 @@ func (c *AdminStoreConfig) validate() error {
 	}
 	if c.StartupWait <= 0 {
 		return fmt.Errorf("xscaler_admin_store: startup_wait must be positive")
+	}
+
+	if _, err := xstenant.ParseEnforceMode(c.EnforceState); c.EnforceState != "" && err != nil {
+		return fmt.Errorf("xscaler_admin_store: enforce_state: %w", err)
 	}
 
 	switch c.Backend {
