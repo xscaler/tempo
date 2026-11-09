@@ -98,6 +98,13 @@ func wrapErrorIfRetryable(err error, dur *durationpb.Duration, enabled bool) err
 		return err
 	}
 
+	// keep a RetryInfo the pusher already attached, such as the billing soft lock delay
+	for _, d := range s.Details() {
+		if _, ok := d.(*errdetails.RetryInfo); ok {
+			return err
+		}
+	}
+
 	// If retryInfo is NOT enabled, return error as is.
 	if !enabled {
 		return err

@@ -104,3 +104,24 @@ func TestAdminStoreCheckPushLeavesReadsAlone(t *testing.T) {
 	require.Equal(t, 24*time.Hour, o.BlockRetention("t-locked"))
 	require.Equal(t, o.MaxBytesPerTagValuesQuery("t-active"), o.MaxBytesPerTagValuesQuery("t-locked"))
 }
+
+func TestParseEnforceModeOnce(t *testing.T) {
+	for in, want := range map[string]xstenant.EnforceMode{
+		"": xstenant.EnforceOff, "off": xstenant.EnforceOff, "shadow": xstenant.EnforceShadow, "On": xstenant.EnforceOn,
+	} {
+		require.Equal(t, want, parseEnforceMode(in), in)
+	}
+
+	dir := t.TempDir()
+	publishGateStore(t, dir, gateTenants)
+	o := newAdminStoreTestOverrides(t, dir, "", prometheus.NewRegistry(), func(c *Config) {
+		c.XscalerAdminStore.EnforceState = "on"
+	})
+	rc, ok := o.(*runtimeConfigOverridesManager)
+	require.True(t, ok)
+	require.Equal(t, xstenant.EnforceOn, rc.adminStore.enforce)
+	// the stored mode is what the gate uses, the config string is not read again
+	rc.adminStore.cfg.EnforceState = "off"
+	deny, _ := CheckPush(o, "t-locked")
+	require.True(t, deny)
+}

@@ -18,17 +18,21 @@ func CheckPush(o Interface, tenant string) (deny bool, reason string) {
 	return false, ""
 }
 
-// enforceMode returns the configured push enforcement mode. validate has checked the value.
-func (c *AdminStoreConfig) enforceMode() xstenant.EnforceMode {
-	m, err := xstenant.ParseEnforceMode(c.EnforceState)
-	if err != nil { // empty or invalid: validate rejects invalid values
+// parseEnforceMode parses the configured push enforcement mode. An empty value is off. validate
+// rejects invalid values before a source is built.
+func parseEnforceMode(v string) xstenant.EnforceMode {
+	if v == "" {
+		return xstenant.EnforceOff
+	}
+	m, err := xstenant.ParseEnforceMode(v)
+	if err != nil {
 		return xstenant.EnforceOff
 	}
 	return m
 }
 
 func (s *adminStoreSource) checkPush(tenant string) (bool, string) {
-	return s.reader.CheckPush(tenant, s.cfg.enforceMode())
+	return s.reader.CheckPush(tenant, s.enforce)
 }
 
 // CheckPush implements PushGate.

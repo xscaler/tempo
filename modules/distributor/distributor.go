@@ -26,8 +26,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/grafana/tempo/modules/distributor/forwarder"
 	"github.com/grafana/tempo/modules/distributor/receiver"
@@ -447,13 +450,19 @@ func (d *Distributor) checkForRateLimits(tracesSize, spanCount int, userID strin
 	return nil
 }
 
-func (d *Distributor) extractBasicInfo(ctx context.Context, traces ptrace.Traces) (userID string, spanCount, tracesSize int, err error) {
-	orgID, e := validation.ExtractValidTenantID(ctx)
-	if e != nil {
-		return "", 0, 0, status.Error(codes.InvalidArgument, e.Error())
-	}
+// softLockRetryDelay is the retry delay sent with a billing soft lock denial. A soft lock lasts
+// longer than a rate limit window, so clients back off for a minute and keep the data queued.
+const softLockRetryDelay = 60 * time.Second
 
-	return orgID, traces.SpanCount(), (&ptrace.ProtoMarshaler{}).TracesSize(traces), nil
+// softLockError is the error for a push denied by the billing soft lock. It always carries a
+// RetryInfo detail, independent of retry_after_on_resource_exhausted, so OTLP/HTTP clients get
+// 429 with Retry-After and gRPC exporters treat the error as retryable.
+func softLockError(userID, reason string) error {
+	st := grpcstatus.New(codes.ResourceExhausted, fmt.Sprintf("%s: pushes are blocked for tenant %s (%s)", overrides.ErrorPrefixRateLimited, userID, reason))
+	if withInfo, err := st.WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(softLockRetryDelay)}); err == nil {
+		st = withInfo
+	}
+	return st.Err()
 }
 
 // PushTraces pushes a batch of traces
@@ -463,6 +472,19 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 	ctx, span := tracer.Start(ctx, "distributor.PushTraces")
 	defer span.End()
 
+	userID, err := validation.ExtractValidTenantID(ctx)
+	if err != nil {
+		// can't record discarded spans here b/c there's no tenant
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	// billing soft lock: deny before middlewares, ingress metrics and the artificial delay, so a
+	// denied push costs nothing and is not counted as ingress
+	if deny, reason := overrides.CheckPush(d.overrides, userID); deny {
+		overrides.RecordDiscardedSpans(traces.SpanCount(), reason, userID)
+		return nil, softLockError(userID, reason)
+	}
+
 	// Call trace push middlewares
 	for _, mw := range d.tracePushMiddlewares {
 		if err := mw(ctx, traces); err != nil {
@@ -470,11 +492,7 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		}
 	}
 
-	userID, spanCount, size, err := d.extractBasicInfo(ctx, traces)
-	if err != nil {
-		// can't record discarded spans here b/c there's no tenant
-		return nil, err
-	}
+	spanCount, size := traces.SpanCount(), (&ptrace.ProtoMarshaler{}).TracesSize(traces)
 	span.SetAttributes(attribute.String("orgID", userID))
 	defer d.padWithArtificialDelay(reqStart, userID)
 	metricIngressBytes.WithLabelValues(userID).Add(float64(size))
@@ -482,12 +500,6 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 
 	if spanCount == 0 {
 		return &tempopb.PushResponse{}, nil
-	}
-
-	// billing soft lock: deny the push before any limit is charged
-	if deny, reason := overrides.CheckPush(d.overrides, userID); deny {
-		overrides.RecordDiscardedSpans(spanCount, reason, userID)
-		return nil, status.Errorf(codes.ResourceExhausted, "%s: pushes are blocked for tenant %s (%s)", overrides.ErrorPrefixRateLimited, userID, reason)
 	}
 
 	// check limits
