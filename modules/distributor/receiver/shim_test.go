@@ -362,6 +362,85 @@ func TestKafkaWriteTimeoutGRPCStatus(t *testing.T) {
 		"expected retryable Unavailable, got %s (Unknown here would mean the raw error escaped without status conversion)", st.Code())
 }
 
+// retryInfoPusher fails every push with err and reports retry info as enabled.
+type retryInfoPusher struct{ err error }
+
+func (p *retryInfoPusher) PushTraces(context.Context, ptrace.Traces) (*tempopb.PushResponse, error) {
+	return nil, p.err
+}
+
+func (p *retryInfoPusher) RetryInfoEnabled(context.Context) (bool, error) { return true, nil }
+
+func retryInfoErr(t *testing.T, d time.Duration) error {
+	t.Helper()
+	st, err := status.New(codes.ResourceExhausted, "blocked").WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(d)})
+	require.NoError(t, err)
+	return st.Err()
+}
+
+func runRetryShim(t *testing.T, proto string, pusher TracesPusher) func() {
+	level := dslog.Level{}
+	_ = level.Set("info")
+	cfg := map[string]interface{}{"otlp": map[string]interface{}{"protocols": map[string]interface{}{proto: nil}}}
+	shim, err := New(cfg, pusher, FakeTenantMiddleware(), 5*time.Second, level, prometheus.NewPedanticRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), shim))
+	return func() { _ = services.StopAndAwaitTerminated(context.Background(), shim) }
+}
+
+// A RetryInfo set by the pusher wins over the configured retry delay, over HTTP and gRPC.
+func TestPusherRetryInfoWinsHTTP(t *testing.T) {
+	stop := runRetryShim(t, "http", &retryInfoPusher{err: retryInfoErr(t, 60*time.Second)})
+	defer stop()
+
+	body, err := ptraceotlp.NewExportRequestFromTraces(testdata.GenerateTraces(1)).MarshalProto()
+	require.NoError(t, err)
+
+	var resp *http.Response
+	require.Eventually(t, func() bool {
+		req, e := http.NewRequest(http.MethodPost, "http://127.0.0.1:4318/v1/traces", bytes.NewReader(body))
+		if e != nil {
+			return false
+		}
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		resp, e = (&http.Client{Timeout: time.Second}).Do(req)
+		return e == nil
+	}, 5*time.Second, 50*time.Millisecond)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	require.Equal(t, "60", resp.Header.Get("Retry-After"))
+}
+
+func TestPusherRetryInfoWinsGRPC(t *testing.T) {
+	stop := runRetryShim(t, "grpc", &retryInfoPusher{err: retryInfoErr(t, 60*time.Second)})
+	defer stop()
+
+	conn, err := grpc.NewClient("127.0.0.1:4317", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+	client := ptraceotlp.NewGRPCClient(conn)
+
+	var st *status.Status
+	require.Eventually(t, func() bool {
+		_, e := client.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(testdata.GenerateTraces(1)))
+		s, ok := status.FromError(e)
+		if e == nil || !ok || s.Code() != codes.ResourceExhausted {
+			return false
+		}
+		st = s
+		return true
+	}, 5*time.Second, 50*time.Millisecond)
+
+	var delays []time.Duration
+	for _, d := range st.Details() {
+		if ri, ok := d.(*errdetails.RetryInfo); ok {
+			delays = append(delays, ri.GetRetryDelay().AsDuration())
+		}
+	}
+	require.Equal(t, []time.Duration{60 * time.Second}, delays)
+}
+
 // TestWrapRetryableError confirms that errors are wrapped as expected
 func TestWrapRetryableError(t *testing.T) {
 	// no wrapping b/c not a grpc error
@@ -387,6 +466,11 @@ func TestWrapRetryableError(t *testing.T) {
 	wrapped = wrapErrorIfRetryable(err, durationpb.New(time.Second), false)
 	require.Equal(t, err, wrapped)
 	require.False(t, isRetryable(wrapped))
+
+	// no wrapping b/c the error already carries a RetryInfo
+	err = retryInfoErr(t, time.Minute)
+	wrapped = wrapErrorIfRetryable(err, durationpb.New(time.Second), true)
+	require.Equal(t, err, wrapped)
 
 	// wrapping b/c this is a resource exhausted grpc error with retry info enabled
 	err = status.Error(codes.ResourceExhausted, "res exhausted")

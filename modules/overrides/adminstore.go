@@ -41,8 +41,10 @@ type adminStoreSource struct {
 	defaultsJSON []byte
 	validator    Validator
 	reader       *xstenant.Reader
-	source       *xstenant.Source[*Overrides]
-	logger       log.Logger
+	// enforce is the push gate mode, parsed once from cfg.EnforceState.
+	enforce xstenant.EnforceMode
+	source  *xstenant.Source[*Overrides]
+	logger  log.Logger
 
 	stop func()
 }
@@ -77,6 +79,7 @@ func newAdminStoreSource(cfg AdminStoreConfig, defaults *Overrides, validator Va
 		defaultsJSON: defaultsJSON,
 		validator:    validator,
 		reader:       reader,
+		enforce:      parseEnforceMode(cfg.EnforceState),
 		logger:       logger,
 	}
 	s.source = xstenant.NewSource(reader, adminStoreEngine, s.decode, logger, reg)

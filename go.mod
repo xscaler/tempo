@@ -65,7 +65,7 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	github.com/twmb/franz-go/plugin/kotel v1.6.0
 	github.com/twmb/franz-go/plugin/kprom v1.2.1
-	github.com/xscaler/dskit/xstenant v0.1.0
+	github.com/xscaler/dskit/xstenant v0.2.0
 	go.opentelemetry.io/collector/client v1.59.0
 	go.opentelemetry.io/collector/component v1.59.0
 	go.opentelemetry.io/collector/component/componenttest v0.153.0

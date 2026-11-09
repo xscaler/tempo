@@ -64,6 +64,8 @@ XS_PATCH_PATHS=(
   "go.sum"
   "modules/backendscheduler/backendscheduler.go"
   "modules/backendworker/backendworker.go"
+  "modules/distributor/distributor.go"
+  "modules/distributor/adminstore*.go"
   "modules/overrides/adminstore*.go"
   "modules/overrides/config.go"
   "modules/overrides/runtime_config_overrides.go"

@@ -841,6 +841,7 @@ overrides:
         cache_dir: ""
         poll_interval: 5s
         startup_wait: 30s
+        enforce_state: "off"
         backend: ""
         local:
             path: ""
