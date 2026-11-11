@@ -30,6 +30,11 @@ type recordIter interface {
 
 type consumeFn func(context.Context, recordIter, time.Time) (*kadm.Offset, error)
 
+// offsetLister resolves the first offset at or after a timestamp. *kadm.Client implements it.
+type offsetLister interface {
+	ListOffsetsAfterMilli(ctx context.Context, millisecond int64, topics ...string) (kadm.ListedOffsets, error)
+}
+
 type PartitionReader struct {
 	services.Service
 
@@ -39,6 +44,17 @@ type PartitionReader struct {
 
 	client *kgo.Client
 	adm    *kadm.Client
+
+	// lookbackLister resolves timestamps to offsets for the lookback replay and
+	// the lookback cutoff. It defaults to adm. A separate client is needed when
+	// the reader's client ID routes requests to a broker that answers timestamp
+	// lookups wrongly: AutoMQ's zone proxy brokers (automq_az client IDs)
+	// return -1, which made a restarted live-store start at the end of the
+	// partition and replay nothing.
+	lookbackLister offsetLister
+	// lookbackClient backs lookbackLister when it is a separate client. The
+	// reader owns it and closes it once the start offset is known.
+	lookbackClient *kgo.Client
 
 	lookbackPeriod    time.Duration
 	commitInterval    time.Duration
@@ -53,18 +69,31 @@ type PartitionReader struct {
 	logger log.Logger
 }
 
-func NewPartitionReaderForPusher(client *kgo.Client, partitionID int32, cfg ingest.KafkaConfig, commitInterval time.Duration, lookbackPeriod time.Duration, forceFromLookback bool, consume consumeFn, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
+// NewPartitionReaderForPusher creates a partition reader. lookbackClient, when
+// not nil, is used only to resolve the lookback start offset; the reader takes
+// ownership and closes it once that offset is known.
+func NewPartitionReaderForPusher(client, lookbackClient *kgo.Client, partitionID int32, cfg ingest.KafkaConfig, commitInterval time.Duration, lookbackPeriod time.Duration, forceFromLookback bool, consume consumeFn, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
 	metrics := newPartitionReaderMetrics(partitionID, reg)
-	return newPartitionReader(client, partitionID, cfg, commitInterval, lookbackPeriod, forceFromLookback, consume, logger, metrics)
+	r, err := newPartitionReader(client, partitionID, cfg, commitInterval, lookbackPeriod, forceFromLookback, consume, logger, metrics)
+	if err != nil {
+		return nil, err
+	}
+	if lookbackClient != nil {
+		r.lookbackClient = lookbackClient
+		r.lookbackLister = kadm.NewClient(lookbackClient)
+	}
+	return r, nil
 }
 
 func newPartitionReader(client *kgo.Client, partitionID int32, cfg ingest.KafkaConfig, commitInterval time.Duration, lookbackPeriod time.Duration, forceFromLookback bool, consume consumeFn, logger log.Logger, metrics partitionReaderMetrics) (*PartitionReader, error) {
+	adm := kadm.NewClient(client)
 	r := &PartitionReader{
 		partitionID:       partitionID,
 		consumerGroup:     cfg.ConsumerGroup,
 		topic:             cfg.Topic,
 		client:            client,
-		adm:               kadm.NewClient(client),
+		adm:               adm,
+		lookbackLister:    adm,
 		lookbackPeriod:    lookbackPeriod,
 		commitInterval:    commitInterval,
 		forceFromLookback: forceFromLookback,
@@ -83,6 +112,11 @@ func (r *PartitionReader) start(context.Context) error {
 
 func (r *PartitionReader) running(ctx context.Context) error {
 	offset, err := r.fetchLastCommittedOffsetWithRetries(ctx)
+	if r.lookbackClient != nil {
+		// Only needed for the start offset; don't keep a second connection set open.
+		r.lookbackClient.Close()
+		r.lookbackClient = nil
+	}
 	if err != nil {
 		// Shutdown can cancel the reader before the initial offset lookup completes.
 		// Treat that as a clean stop instead of failing the service.
@@ -280,13 +314,38 @@ func (r *PartitionReader) fetchLastCommittedOffset(ctx context.Context) (kgo.Off
 		if r.lookbackPeriod == 0 {
 			return kgo.NewOffset().AtEnd(), nil
 		}
-		return kgo.NewOffset().AfterMilli(time.Now().Add(-r.lookbackPeriod).UnixMilli()), nil
+		return r.lookbackStartOffset(ctx)
 	}
 	return r.cutoffOffset(ctx, offset)
 }
 
+// lookbackStartOffset resolves the first offset inside the lookback period to
+// an exact offset. It does the lookup itself, through lookbackLister, instead
+// of handing kgo an AfterMilli offset: kgo would resolve AfterMilli through the
+// reader's own client, which may reach a broker that answers wrongly (see
+// lookbackLister).
+func (r *PartitionReader) lookbackStartOffset(ctx context.Context) (kgo.Offset, error) {
+	millis := time.Now().Add(-r.lookbackPeriod).UnixMilli()
+	offsets, err := r.lookbackLister.ListOffsetsAfterMilli(ctx, millis, r.topic)
+	if err != nil {
+		return kgo.NewOffset(), fmt.Errorf("list offsets after %d: %w", millis, err)
+	}
+	listed, found := offsets.Lookup(r.topic, r.partitionID)
+	if !found || errors.Is(listed.Err, kerr.UnknownTopicOrPartition) {
+		// The partition doesn't exist yet. Keep the previous behaviour: let kgo
+		// resolve the timestamp once the partition appears.
+		level.Info(r.logger).Log("msg", "partition not found for lookback offset lookup, deferring to the reader client", "lookback", r.lookbackPeriod)
+		return kgo.NewOffset().AfterMilli(millis), nil
+	}
+	if listed.Err != nil {
+		return kgo.NewOffset(), fmt.Errorf("list offsets after %d: %w", millis, listed.Err)
+	}
+	level.Info(r.logger).Log("msg", "resolved lookback start offset", "lookback", r.lookbackPeriod, "offset", listed.Offset)
+	return kgo.NewOffset().At(listed.Offset), nil
+}
+
 func (r *PartitionReader) cutoffOffset(ctx context.Context, offset kadm.OffsetResponse) (kgo.Offset, error) {
-	offsets, err := r.adm.ListOffsetsAfterMilli(ctx, time.Now().Add(-r.lookbackPeriod).UnixMilli(), r.topic)
+	offsets, err := r.lookbackLister.ListOffsetsAfterMilli(ctx, time.Now().Add(-r.lookbackPeriod).UnixMilli(), r.topic)
 	if err != nil {
 		return kgo.NewOffset(), err
 	}
