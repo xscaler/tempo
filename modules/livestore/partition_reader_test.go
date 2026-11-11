@@ -53,7 +53,9 @@ func TestPartitionReaderCommits(t *testing.T) {
 		r := defaultPartitionReaderWithCommitInterval(t, address, 0, consumeFn)
 
 		assert.Eventually(t, func() bool { return kafkaCommits.Load() >= 1 }, time.Second*2, 10*time.Millisecond)
-		assert.Equal(t, int64(0), r.lag.Load())
+		// The reader commits before it updates the lag, and the start-up lag is
+		// the one pending record, so wait for the lag to settle.
+		assert.Eventually(t, func() bool { return r.lag.Load() == 0 }, time.Second*2, 10*time.Millisecond)
 
 		t.Cleanup(func() { require.NoError(t, services.StopAndAwaitTerminated(context.Background(), r)) })
 	})
@@ -125,9 +127,10 @@ func TestPartitionReaderLag(t *testing.T) {
 		testkafka.SendReq(t.Context(), t, client, ingest.Encode, testTenantID)
 	}
 
-	time.Sleep(time.Second)
+	// Lag comes from the high watermark of the last fetch, so wait until a
+	// fetch has seen every record instead of sleeping a fixed time.
+	assert.Eventually(t, func() bool { return r.lag.Load() == int64(records)-1 }, 5*time.Second, 10*time.Millisecond, "lag should be every record but the committed one")
 	assert.Equal(t, int32(1), kafkaCommits.Load(), "only one record should be committed")
-	assert.Equal(t, int64(records)-1, r.lag.Load(), "only one record should be committed")
 
 	t.Cleanup(func() { require.NoError(t, services.StopAndAwaitTerminated(context.Background(), r)) })
 }
