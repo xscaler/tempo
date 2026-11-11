@@ -678,7 +678,7 @@ live_store:
     # timestamp lookups wrongly, such as AutoMQ zone routing (`automq_az=...`): its zone proxy
     # brokers answer -1 and the live-store would start at the end of the partition, replaying nothing.
     # Empty uses the reader's own client.
-    [lookback_offset_client_id: <string> | default = ""]
+    [xtraces_lookback_offset_client_id: <string> | default = ""]
 
     # Path to the shutdown marker directory.
     [shutdown_marker_dir: <string> | default = "/var/tempo/live-store/shutdown-marker"]

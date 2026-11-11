@@ -393,13 +393,13 @@ func (s *LiveStore) shouldForceFromLookback(ctx context.Context) bool {
 }
 
 // newLookbackOffsetClient returns the client that resolves the lookback start
-// offset, or nil to use the reader's own client. See Config.LookbackOffsetClientID.
+// offset, or nil to use the reader's own client. See Config.XtracesLookbackOffsetClientID.
 func (s *LiveStore) newLookbackOffsetClient() (*kgo.Client, error) {
-	if s.cfg.LookbackOffsetClientID == "" {
+	if s.cfg.XtracesLookbackOffsetClientID == "" {
 		return nil, nil
 	}
 	cfg := s.cfg.IngestConfig.Kafka
-	cfg.ClientID = s.cfg.LookbackOffsetClientID
+	cfg.ClientID = s.cfg.XtracesLookbackOffsetClientID
 	// Throwaway registry: the client lives for one lookup and must not clash
 	// with the reader client's metrics.
 	client, err := ingest.NewReaderClient(cfg, ingest.NewReaderClientMetrics(liveStoreServiceName, prometheus.NewRegistry()), s.logger)

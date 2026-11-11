@@ -75,13 +75,13 @@ type Config struct {
 	// the owner registration across restarts.
 	RemoveOwnerOnShutdown bool `yaml:"remove_owner_on_shutdown"`
 
-	// LookbackOffsetClientID, when set, is the Kafka client ID of a short-lived
+	// XtracesLookbackOffsetClientID, when set, is the Kafka client ID of a short-lived
 	// client used only to find where the lookback replay starts. Set it when the
 	// main client ID routes requests to brokers that answer timestamp lookups
 	// wrongly, such as AutoMQ zone routing (automq_az=...), whose zone proxy
 	// brokers return -1 and made a restarted live-store replay nothing.
 	// Empty uses the reader's own client.
-	LookbackOffsetClientID string `yaml:"lookback_offset_client_id"`
+	XtracesLookbackOffsetClientID string `yaml:"xtraces_lookback_offset_client_id"`
 
 	// testing config
 	holdAllBackgroundProcesses bool `yaml:"-"` // if this is set to true, the live store will never release its background processes
@@ -141,7 +141,7 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	f.DurationVar(&cfg.ReadinessTargetLag, prefix+".readiness-target-lag", cfg.ReadinessTargetLag, "Target lag threshold before live-store is ready. 0 disables waiting (backward compatible).")
 	f.DurationVar(&cfg.ReadinessMaxWait, prefix+".readiness-max-wait", cfg.ReadinessMaxWait, "Maximum time to wait for catching up at startup. Only used if readiness-target-lag > 0.")
 	f.BoolVar(&cfg.RemoveOwnerOnShutdown, prefix+".remove-owner-on-shutdown", cfg.RemoveOwnerOnShutdown, "Remove partition owner from the ring on shutdown.")
-	f.StringVar(&cfg.LookbackOffsetClientID, prefix+".lookback-offset-client-id", "", "Kafka client ID used only to look up where the lookback replay starts. Set it when the main client ID routes to brokers that answer timestamp lookups wrongly (AutoMQ automq_az zone routing). Empty uses the reader's client.")
+	f.StringVar(&cfg.XtracesLookbackOffsetClientID, prefix+".xtraces-lookback-offset-client-id", "", "Kafka client ID used only to look up where the lookback replay starts. Set it when the main client ID routes to brokers that answer timestamp lookups wrongly (AutoMQ automq_az zone routing). Empty uses the reader's client.")
 
 	cfg.WAL.RegisterFlags(f) // WAL config has no flags, only defaults
 	f.StringVar(&cfg.WAL.Filepath, prefix+".wal.path", "/var/tempo/live-store/traces", "Path at which store WAL blocks.")
