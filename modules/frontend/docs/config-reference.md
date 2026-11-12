@@ -1187,4 +1187,5 @@ live_store:
     readiness_max_wait: 30m0s
     fail_on_high_lag: true
     remove_owner_on_shutdown: true
+    xtraces_lookback_offset_client_id: ""
 ```

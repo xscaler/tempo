@@ -392,6 +392,23 @@ func (s *LiveStore) shouldForceFromLookback(ctx context.Context) bool {
 	return true
 }
 
+// newLookbackOffsetClient returns the client that resolves the lookback start
+// offset, or nil to use the reader's own client. See Config.XtracesLookbackOffsetClientID.
+func (s *LiveStore) newLookbackOffsetClient() (*kgo.Client, error) {
+	if s.cfg.XtracesLookbackOffsetClientID == "" {
+		return nil, nil
+	}
+	cfg := s.cfg.IngestConfig.Kafka
+	cfg.ClientID = s.cfg.XtracesLookbackOffsetClientID
+	// Throwaway registry: the client lives for one lookup and must not clash
+	// with the reader client's metrics.
+	client, err := ingest.NewReaderClient(cfg, ingest.NewReaderClientMetrics(liveStoreServiceName, prometheus.NewRegistry()), s.logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kafka lookback offset client: %w", err)
+	}
+	return client, nil
+}
+
 func (s *LiveStore) startKafkaIngestPath(ctx context.Context) error {
 	forceFromLookback := s.shouldForceFromLookback(ctx)
 
@@ -409,9 +426,17 @@ func (s *LiveStore) startKafkaIngestPath(ctx context.Context) error {
 		return fmt.Errorf("failed to start livestore: %w", err)
 	}
 
-	lookbackPeriod := 2 * s.cfg.CompleteBlockTimeout
-	reader, err := NewPartitionReaderForPusher(s.client, s.ingestPartitionID, s.cfg.IngestConfig.Kafka, s.cfg.CommitInterval, lookbackPeriod, forceFromLookback, s.consume, s.logger, s.reg)
+	lookbackClient, err := s.newLookbackOffsetClient()
 	if err != nil {
+		return err
+	}
+
+	lookbackPeriod := 2 * s.cfg.CompleteBlockTimeout
+	reader, err := NewPartitionReaderForPusher(s.client, lookbackClient, s.ingestPartitionID, s.cfg.IngestConfig.Kafka, s.cfg.CommitInterval, lookbackPeriod, forceFromLookback, s.consume, s.logger, s.reg)
+	if err != nil {
+		if lookbackClient != nil {
+			lookbackClient.Close()
+		}
 		return fmt.Errorf("failed to create partition reader: %w", err)
 	}
 	s.reader = reader

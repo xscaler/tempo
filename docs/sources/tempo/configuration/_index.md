@@ -673,6 +673,13 @@ live_store:
     # Remove partition owner from the ring on shutdown.
     [remove_owner_on_shutdown: <bool> | default = true]
 
+    # Kafka client ID used only to look up where the lookback replay starts after a restart
+    # without local data. Set it when the main client ID routes requests to brokers that answer
+    # timestamp lookups wrongly, such as AutoMQ zone routing (`automq_az=...`): its zone proxy
+    # brokers answer -1 and the live-store would start at the end of the partition, replaying nothing.
+    # Empty uses the reader's own client.
+    [xtraces_lookback_offset_client_id: <string> | default = ""]
+
     # Path to the shutdown marker directory.
     [shutdown_marker_dir: <string> | default = "/var/tempo/live-store/shutdown-marker"]
 

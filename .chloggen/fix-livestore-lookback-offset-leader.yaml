@@ -1,0 +1,9 @@
+change_type: bug_fix
+component: live-store
+note: "Resolve the lookback replay start offset explicitly, optionally through a separate `xtraces_lookback_offset_client_id`, so a restarted live-store replays recent traces behind AutoMQ zone routing."
+issues: []
+subtext: |
+  With AutoMQ zone routing (`automq_az=...` client IDs), zone proxy brokers answer ListOffsets by timestamp with -1,
+  so a live-store restarting without local data started at the end of the partition and served searches without
+  the last `2 x complete_block_timeout` of traces. Set `xtraces_lookback_offset_client_id` to an ID without `automq_az`.
+user: pathumf
