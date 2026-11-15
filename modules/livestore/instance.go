@@ -147,6 +147,14 @@ type instance struct {
 	liveTracesIterNext func() (*livetraces.LiveTrace[*v1.ResourceSpans], bool)
 	liveTracesIterStop func()
 
+	// cutMtx serialises cutting live traces to the WAL. The per-tenant
+	// background loop and the catch-up path in consume() both cut, and they
+	// share liveTracesIterNext.
+	cutMtx sync.Mutex
+	// lastCatchUpCut is the record time of the last catch-up cut. Only the
+	// consume goroutine reads and writes it.
+	lastCatchUpCut time.Time
+
 	// Metrics
 	tracesCreatedTotal prometheus.Counter
 	bytesReceivedTotal *prometheus.CounterVec
@@ -348,6 +356,39 @@ func countSpans(trace *tempopb.Trace) int {
 }
 
 func (i *instance) cutIdleTraces(ctx context.Context, immediate bool) (bool, error) {
+	return i.cutIdleTracesAsOf(ctx, time.Now(), immediate)
+}
+
+// needsCatchUpCut reports whether consume() should cut idle traces as of
+// recordTime while it is replaying records that are behind wall-clock time.
+// It cuts once per flushPeriod of record time, mirroring the wall-clock
+// background loop, and straight away once live traces reach 3/4 of the
+// tenant's limit, so a replay never fills the limit with traces that are
+// already idle by record time.
+func (i *instance) needsCatchUpCut(recordTime time.Time, flushPeriod time.Duration) bool {
+	if recordTime.Sub(i.lastCatchUpCut) >= flushPeriod {
+		i.lastCatchUpCut = recordTime
+		return true
+	}
+
+	maxLiveTraces := i.overrides.MaxLocalTracesPerUser(i.tenantID)
+	if maxLiveTraces <= 0 {
+		return false
+	}
+	i.liveTracesMtx.Lock()
+	n := i.liveTraces.Len()
+	i.liveTracesMtx.Unlock()
+	if n >= uint64(maxLiveTraces)*3/4 {
+		i.lastCatchUpCut = recordTime
+		return true
+	}
+	return false
+}
+
+// cutIdleTracesAsOf cuts the traces that are idle (or past max live time) as
+// of asOf into the head block. Concurrent callers must hold cutMtx; the
+// live-store does this in cutOneInstanceToWalAsOf.
+func (i *instance) cutIdleTracesAsOf(ctx context.Context, asOf time.Time, immediate bool) (bool, error) {
 	_, span := tracer.Start(ctx, "instance.cutIdleTraces",
 		oteltrace.WithAttributes(attribute.String("tenant", i.tenantID)))
 	defer span.End()
@@ -359,7 +400,7 @@ func (i *instance) cutIdleTraces(ctx context.Context, immediate bool) (bool, err
 	metricLiveTraces.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Len()))
 	metricLiveTraceBytes.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Size()))
 	if i.liveTracesIterNext == nil {
-		i.liveTracesIterNext, i.liveTracesIterStop = iter.Pull(i.liveTraces.CutIdle(time.Now(), immediate))
+		i.liveTracesIterNext, i.liveTracesIterStop = iter.Pull(i.liveTraces.CutIdle(asOf, immediate))
 	}
 
 	i.liveTracesMtx.Unlock()

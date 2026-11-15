@@ -104,6 +104,12 @@ var (
 		Help:      "The total number of kafka records dropped per tenant.",
 	}, []string{"tenant", "reason"})
 
+	metricCatchUpCuts = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tempo_live_store",
+		Name:      "catch_up_cuts_total",
+		Help:      "Cuts of idle live traces made by record time while consuming records that are behind wall-clock time.",
+	}, []string{"tenant"})
+
 	// Readiness metrics
 	metricCatchUpDuration = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "tempo_live_store",
@@ -693,6 +699,17 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 			continue
 		}
 
+		// While replaying records that are behind wall-clock time (lookback
+		// replay after a restart, or catching up after a stall), cut idle
+		// traces by record time. The wall-clock background loop runs every
+		// flush period, and a replay delivers minutes of records in that
+		// time, which would fill max_traces_per_user with traces that are
+		// already idle and discard the rest (xscaler/tempo#16).
+		if lag > s.cfg.MaxTraceIdle && inst.needsCatchUpCut(record.Timestamp, s.cfg.InstanceFlushPeriod) {
+			s.cutOneInstanceToWalAsOf(ctx, inst, record.Timestamp, false)
+			metricCatchUpCuts.WithLabelValues(tenant).Inc()
+		}
+
 		// Push data to tenant instance
 		inst.pushBytes(ctx, record.Timestamp, pushReq)
 
@@ -773,6 +790,13 @@ func (s *LiveStore) cutAllInstancesToWal() {
 }
 
 func (s *LiveStore) cutOneInstanceToWal(ctx context.Context, inst *instance, immediate bool) {
+	s.cutOneInstanceToWalAsOf(ctx, inst, time.Now(), immediate)
+}
+
+// cutOneInstanceToWalAsOf cuts traces that are idle as of asOf to the head
+// block, and cuts and enqueues full head blocks. The background loop passes
+// wall-clock time; consume() passes the record time while catching up.
+func (s *LiveStore) cutOneInstanceToWalAsOf(ctx context.Context, inst *instance, asOf time.Time, immediate bool) {
 	ctx, span := tracer.Start(ctx, "LiveStore.cutOneInstanceToWal",
 		oteltrace.WithAttributes(
 			attribute.String("tenant", inst.tenantID),
@@ -780,11 +804,14 @@ func (s *LiveStore) cutOneInstanceToWal(ctx context.Context, inst *instance, imm
 		))
 	defer span.End()
 
+	inst.cutMtx.Lock()
+	defer inst.cutMtx.Unlock()
+
 	var liveTracesDrained bool
 	var err error
 	for !liveTracesDrained {
 		// Regular trace cuts (live traces -> head block)
-		liveTracesDrained, err = inst.cutIdleTraces(ctx, immediate)
+		liveTracesDrained, err = inst.cutIdleTracesAsOf(ctx, asOf, immediate)
 		if err != nil {
 			level.Error(s.logger).Log("msg", "failed to cut idle traces", "tenant", inst.tenantID, "err", err)
 			span.SetStatus(codes.Error, err.Error())
