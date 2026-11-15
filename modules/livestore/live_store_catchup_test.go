@@ -50,14 +50,22 @@ func recordsAt(t *testing.T, tenant string, n int, start time.Time, step time.Du
 	return records
 }
 
+// counter reads a global per-tenant counter. The counters are promauto
+// globals and add up across test runs (-count), so tests compare deltas.
+func counter(t *testing.T, c *prometheus.CounterVec, tenant string) float64 {
+	t.Helper()
+	return test.MustGetCounterValue(c.WithLabelValues(tenant))
+}
+
 // tracesKept cuts every remaining live trace and returns how many traces the
-// tenant wrote to its head block in total, which is every trace it kept.
-func tracesKept(t *testing.T, ls *LiveStore, tenant string) int {
+// tenant wrote to its head block since tracesBefore (an earlier reading of
+// tempo_live_store_traces_created_total), which is every trace it kept.
+func tracesKept(t *testing.T, ls *LiveStore, tenant string, tracesBefore float64) int {
 	t.Helper()
 	inst, err := ls.getOrCreateInstance(tenant)
 	require.NoError(t, err)
 	ls.cutOneInstanceToWal(t.Context(), inst, true)
-	return int(test.MustGetCounterValue(metricTracesCreatedTotal.WithLabelValues(tenant)))
+	return int(counter(t, metricTracesCreatedTotal, tenant) - tracesBefore)
 }
 
 // A replay of more traces than max_traces_per_user, spread over minutes of
@@ -71,6 +79,8 @@ func TestConsumeCatchUpKeepsTracesOverLiveTraceLimit(t *testing.T) {
 		numTraces     = 500
 	)
 	ls := liveStoreWithMaxLiveTraces(t, maxLiveTraces)
+	tracesBefore := counter(t, metricTracesCreatedTotal, tenant)
+	cutsBefore := counter(t, metricCatchUpCuts, tenant)
 
 	now := time.Now()
 	// 500 traces over 10 minutes of record time, starting 12 minutes ago:
@@ -80,13 +90,15 @@ func TestConsumeCatchUpKeepsTracesOverLiveTraceLimit(t *testing.T) {
 	_, err := ls.consume(t.Context(), createRecordIter(records), now)
 	require.NoError(t, err)
 
-	require.Equal(t, numTraces, tracesKept(t, ls, tenant), "every replayed trace must be kept")
-	require.Positive(t, test.MustGetCounterValue(metricCatchUpCuts.WithLabelValues(tenant)), "catch-up cuts must run")
-
-	// Memory stays bounded during the replay: live traces never reach the limit.
+	// Memory stays bounded during the replay: the catch-up cuts leave fewer
+	// live traces than the limit. Every trace kept below also means no push
+	// reached the limit, since a push over it is discarded.
 	inst, err := ls.getOrCreateInstance(tenant)
 	require.NoError(t, err)
 	require.Less(t, inst.liveTraces.Len(), uint64(maxLiveTraces))
+
+	require.Equal(t, numTraces, tracesKept(t, ls, tenant, tracesBefore), "every replayed trace must be kept")
+	require.Positive(t, counter(t, metricCatchUpCuts, tenant)-cutsBefore, "catch-up cuts must run")
 }
 
 // Records at wall-clock time (no lag) take the normal path: no catch-up cuts,
@@ -98,6 +110,8 @@ func TestConsumeNoLagKeepsLiveTraceLimit(t *testing.T) {
 		numTraces     = 500
 	)
 	ls := liveStoreWithMaxLiveTraces(t, maxLiveTraces)
+	tracesBefore := counter(t, metricTracesCreatedTotal, tenant)
+	cutsBefore := counter(t, metricCatchUpCuts, tenant)
 
 	now := time.Now()
 	records := recordsAt(t, tenant, numTraces, now, 0)
@@ -105,8 +119,8 @@ func TestConsumeNoLagKeepsLiveTraceLimit(t *testing.T) {
 	_, err := ls.consume(t.Context(), createRecordIter(records), now)
 	require.NoError(t, err)
 
-	require.Equal(t, maxLiveTraces, tracesKept(t, ls, tenant), "a live burst is still capped by the limit")
-	require.Zero(t, test.MustGetCounterValue(metricCatchUpCuts.WithLabelValues(tenant)), "no catch-up cuts without lag")
+	require.Equal(t, maxLiveTraces, tracesKept(t, ls, tenant, tracesBefore), "a live burst is still capped by the limit")
+	require.Zero(t, counter(t, metricCatchUpCuts, tenant)-cutsBefore, "no catch-up cuts without lag")
 }
 
 // needsCatchUpCut fires once per flush period of record time, and early when
@@ -151,4 +165,14 @@ func TestNeedsCatchUpCut(t *testing.T) {
 
 	push(2) // grows by 1/8 of 16
 	require.True(t, inst.needsCatchUpCut(next.Add(2*time.Millisecond), period), "repeat cut after growth")
+
+	// A wall-clock cut drains live traces below the count left by the last
+	// catch-up cut. Growth is then measured from the lower count, so early
+	// cuts resume at 3/4 of the limit instead of waiting for the next period.
+	ls.cutOneInstanceToWal(t.Context(), inst, true)
+	require.Zero(t, inst.liveTraces.Len())
+	// consume() checks on every lagging record, so it sees the drained count.
+	require.False(t, inst.needsCatchUpCut(next.Add(2*time.Millisecond), period), "nothing to cut after the drain")
+	push(12)
+	require.True(t, inst.needsCatchUpCut(next.Add(3*time.Millisecond), period), "early cut after a wall-clock drain")
 }

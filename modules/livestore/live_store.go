@@ -107,7 +107,7 @@ var (
 	metricCatchUpCuts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "tempo_live_store",
 		Name:      "catch_up_cuts_total",
-		Help:      "Cuts of idle live traces made by record time while consuming records that are behind wall-clock time.",
+		Help:      "Successful cuts of idle live traces made by record time while consuming records that are behind wall-clock time.",
 	}, []string{"tenant"})
 
 	// Readiness metrics
@@ -706,9 +706,10 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 		// time, which would fill max_traces_per_user with traces that are
 		// already idle and discard the rest (xscaler/tempo#16).
 		if lag > s.cfg.MaxTraceIdle && inst.needsCatchUpCut(record.Timestamp, s.cfg.InstanceFlushPeriod) {
-			s.cutOneInstanceToWalAsOf(ctx, inst, record.Timestamp, false)
-			inst.catchUpCutDone(record.Timestamp)
-			metricCatchUpCuts.WithLabelValues(tenant).Inc()
+			if err := s.cutOneInstanceToWalAsOf(ctx, inst, record.Timestamp, false); err == nil {
+				inst.catchUpCutDone(record.Timestamp)
+				metricCatchUpCuts.WithLabelValues(tenant).Inc()
+			}
 		}
 
 		// Push data to tenant instance
@@ -791,13 +792,15 @@ func (s *LiveStore) cutAllInstancesToWal() {
 }
 
 func (s *LiveStore) cutOneInstanceToWal(ctx context.Context, inst *instance, immediate bool) {
-	s.cutOneInstanceToWalAsOf(ctx, inst, time.Now(), immediate)
+	// Errors are logged and retried on the next tick.
+	_ = s.cutOneInstanceToWalAsOf(ctx, inst, time.Now(), immediate)
 }
 
 // cutOneInstanceToWalAsOf cuts traces that are idle as of asOf to the head
 // block, and cuts and enqueues full head blocks. The background loop passes
-// wall-clock time; consume() passes the record time while catching up.
-func (s *LiveStore) cutOneInstanceToWalAsOf(ctx context.Context, inst *instance, asOf time.Time, immediate bool) {
+// wall-clock time; consume() passes the record time while catching up. It
+// logs errors and returns the first error that stopped the cut.
+func (s *LiveStore) cutOneInstanceToWalAsOf(ctx context.Context, inst *instance, asOf time.Time, immediate bool) error {
 	ctx, span := tracer.Start(ctx, "LiveStore.cutOneInstanceToWal",
 		oteltrace.WithAttributes(
 			attribute.String("tenant", inst.tenantID),
@@ -817,14 +820,14 @@ func (s *LiveStore) cutOneInstanceToWalAsOf(ctx context.Context, inst *instance,
 			level.Error(s.logger).Log("msg", "failed to cut idle traces", "tenant", inst.tenantID, "err", err)
 			span.SetStatus(codes.Error, err.Error())
 			span.RecordError(err)
-			break
+			return err
 		}
 		id, err := inst.cutBlocks(ctx, immediate)
 		if err != nil {
 			level.Error(s.logger).Log("msg", "failed to cut blocks", "tenant", inst.tenantID, "err", err)
 			span.SetStatus(codes.Error, err.Error())
 			span.RecordError(err)
-			break
+			return err
 		}
 		if id != uuid.Nil {
 			span.AddEvent("block enqueued for completion",
@@ -835,6 +838,7 @@ func (s *LiveStore) cutOneInstanceToWalAsOf(ctx context.Context, inst *instance,
 			}
 		}
 	}
+	return nil
 }
 
 // CheckReady returns nil if the live-store is ready to serve queries

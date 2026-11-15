@@ -357,6 +357,9 @@ func countSpans(trace *tempopb.Trace) int {
 	return count
 }
 
+// cutIdleTraces cuts the traces that are idle as of wall-clock time. Like
+// cutIdleTracesAsOf, concurrent callers must hold cutMtx, since it uses the
+// same shared iterator.
 func (i *instance) cutIdleTraces(ctx context.Context, immediate bool) (bool, error) {
 	return i.cutIdleTracesAsOf(ctx, time.Now(), immediate)
 }
@@ -369,6 +372,8 @@ func (i *instance) cutIdleTraces(ctx context.Context, immediate bool) (bool, err
 // by record time. An early cut only repeats after live traces grow by another
 // 1/8 of the limit: when the live traces are all still active a cut frees
 // nothing, and cutting again on every record would scan them every time.
+// The wall-clock background loop also cuts during a replay, so the growth is
+// measured from the lowest live-trace count seen since the last catch-up cut.
 func (i *instance) needsCatchUpCut(recordTime time.Time, flushPeriod time.Duration) bool {
 	if recordTime.Sub(i.lastCatchUpCut) >= flushPeriod {
 		return true
@@ -382,6 +387,9 @@ func (i *instance) needsCatchUpCut(recordTime time.Time, flushPeriod time.Durati
 	i.liveTracesMtx.Lock()
 	n := i.liveTraces.Len()
 	i.liveTracesMtx.Unlock()
+	if n < i.catchUpCutLen {
+		i.catchUpCutLen = n
+	}
 	return n >= limit*3/4 && n >= i.catchUpCutLen+max(limit/8, 1)
 }
 
