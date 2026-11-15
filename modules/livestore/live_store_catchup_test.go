@@ -158,7 +158,7 @@ func TestNeedsCatchUpCut(t *testing.T) {
 	require.True(t, inst.needsCatchUpCut(next, period), "at 3/4 of the limit")
 
 	// The traces are active, so the cut frees nothing.
-	ls.cutOneInstanceToWalAsOf(t.Context(), inst, next, false)
+	require.NoError(t, ls.cutOneInstanceToWalAsOf(t.Context(), inst, next, false))
 	inst.catchUpCutDone(next)
 	require.EqualValues(t, 12, inst.liveTraces.Len())
 	require.False(t, inst.needsCatchUpCut(next.Add(time.Millisecond), period), "no repeat cut without growth")
