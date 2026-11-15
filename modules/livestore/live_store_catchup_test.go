@@ -110,27 +110,45 @@ func TestConsumeNoLagKeepsLiveTraceLimit(t *testing.T) {
 }
 
 // needsCatchUpCut fires once per flush period of record time, and early when
-// live traces reach 3/4 of the limit.
+// live traces reach 3/4 of the limit. An early cut that freed nothing only
+// repeats after live traces grow by another 1/8 of the limit.
 func TestNeedsCatchUpCut(t *testing.T) {
-	ls := liveStoreWithMaxLiveTraces(t, 8)
-	inst, err := ls.getOrCreateInstance("needs-cut")
+	const tenant = "needs-cut"
+	ls := liveStoreWithMaxLiveTraces(t, 16)
+	inst, err := ls.getOrCreateInstance(tenant)
 	require.NoError(t, err)
 
 	base := time.Now().Add(-10 * time.Minute)
 	period := 5 * time.Second
 
 	require.True(t, inst.needsCatchUpCut(base, period), "first lagging record cuts")
+	inst.catchUpCutDone(base)
 	require.False(t, inst.needsCatchUpCut(base.Add(time.Second), period), "within the period, below the limit")
 	require.True(t, inst.needsCatchUpCut(base.Add(period), period), "one period of record time later")
+	inst.catchUpCutDone(base.Add(period))
 
-	// Fill live traces to 3/4 of the limit (6 of 8) without advancing record time.
+	// push adds n live traces, all active at the same record time.
 	at := base.Add(period)
-	for _, r := range recordsAt(t, "needs-cut", 6, at, 0) {
-		req, err := ls.decoder.Decode(r.Value)
-		require.NoError(t, err)
-		inst.pushBytes(t.Context(), at, req)
-		ls.decoder.Reset()
+	push := func(n int) {
+		for _, r := range recordsAt(t, tenant, n, at, 0) {
+			req, err := ls.decoder.Decode(r.Value)
+			require.NoError(t, err)
+			inst.pushBytes(t.Context(), at, req)
+			ls.decoder.Reset()
+		}
 	}
-	require.EqualValues(t, 6, inst.liveTraces.Len())
-	require.True(t, inst.needsCatchUpCut(at.Add(time.Millisecond), period), "at 3/4 of the limit")
+
+	push(12) // 3/4 of 16
+	require.EqualValues(t, 12, inst.liveTraces.Len())
+	next := at.Add(time.Millisecond)
+	require.True(t, inst.needsCatchUpCut(next, period), "at 3/4 of the limit")
+
+	// The traces are active, so the cut frees nothing.
+	ls.cutOneInstanceToWalAsOf(t.Context(), inst, next, false)
+	inst.catchUpCutDone(next)
+	require.EqualValues(t, 12, inst.liveTraces.Len())
+	require.False(t, inst.needsCatchUpCut(next.Add(time.Millisecond), period), "no repeat cut without growth")
+
+	push(2) // grows by 1/8 of 16
+	require.True(t, inst.needsCatchUpCut(next.Add(2*time.Millisecond), period), "repeat cut after growth")
 }

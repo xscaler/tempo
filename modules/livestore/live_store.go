@@ -707,6 +707,7 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 		// already idle and discard the rest (xscaler/tempo#16).
 		if lag > s.cfg.MaxTraceIdle && inst.needsCatchUpCut(record.Timestamp, s.cfg.InstanceFlushPeriod) {
 			s.cutOneInstanceToWalAsOf(ctx, inst, record.Timestamp, false)
+			inst.catchUpCutDone(record.Timestamp)
 			metricCatchUpCuts.WithLabelValues(tenant).Inc()
 		}
 

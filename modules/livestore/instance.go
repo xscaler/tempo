@@ -151,9 +151,11 @@ type instance struct {
 	// background loop and the catch-up path in consume() both cut, and they
 	// share liveTracesIterNext.
 	cutMtx sync.Mutex
-	// lastCatchUpCut is the record time of the last catch-up cut. Only the
-	// consume goroutine reads and writes it.
+	// lastCatchUpCut is the record time of the last catch-up cut, and
+	// catchUpCutLen the number of live traces left after it. Only the
+	// consume goroutine reads and writes them.
 	lastCatchUpCut time.Time
+	catchUpCutLen  uint64
 
 	// Metrics
 	tracesCreatedTotal prometheus.Counter
@@ -362,12 +364,13 @@ func (i *instance) cutIdleTraces(ctx context.Context, immediate bool) (bool, err
 // needsCatchUpCut reports whether consume() should cut idle traces as of
 // recordTime while it is replaying records that are behind wall-clock time.
 // It cuts once per flushPeriod of record time, mirroring the wall-clock
-// background loop, and straight away once live traces reach 3/4 of the
-// tenant's limit, so a replay never fills the limit with traces that are
-// already idle by record time.
+// background loop, and early once live traces reach 3/4 of the tenant's
+// limit, so a replay never fills the limit with traces that are already idle
+// by record time. An early cut only repeats after live traces grow by another
+// 1/8 of the limit: when the live traces are all still active a cut frees
+// nothing, and cutting again on every record would scan them every time.
 func (i *instance) needsCatchUpCut(recordTime time.Time, flushPeriod time.Duration) bool {
 	if recordTime.Sub(i.lastCatchUpCut) >= flushPeriod {
-		i.lastCatchUpCut = recordTime
 		return true
 	}
 
@@ -375,14 +378,20 @@ func (i *instance) needsCatchUpCut(recordTime time.Time, flushPeriod time.Durati
 	if maxLiveTraces <= 0 {
 		return false
 	}
+	limit := uint64(maxLiveTraces)
 	i.liveTracesMtx.Lock()
 	n := i.liveTraces.Len()
 	i.liveTracesMtx.Unlock()
-	if n >= uint64(maxLiveTraces)*3/4 {
-		i.lastCatchUpCut = recordTime
-		return true
-	}
-	return false
+	return n >= limit*3/4 && n >= i.catchUpCutLen+max(limit/8, 1)
+}
+
+// catchUpCutDone records a catch-up cut as of recordTime for needsCatchUpCut.
+func (i *instance) catchUpCutDone(recordTime time.Time) {
+	i.liveTracesMtx.Lock()
+	n := i.liveTraces.Len()
+	i.liveTracesMtx.Unlock()
+	i.lastCatchUpCut = recordTime
+	i.catchUpCutLen = n
 }
 
 // cutIdleTracesAsOf cuts the traces that are idle (or past max live time) as
