@@ -118,24 +118,26 @@ jobs:
       - name: Run tests
         env:
           TEST_TARGET: ${{ matrix.test-target }}
-        # modules/livestore needs 6-9 GB with -race. Run alongside the rest of
-        # test-with-cover-others, it starves the 16 GB runner, which then loses
-        # contact with GitHub. Upstream split it out the same way in
-        # grafana/tempo#7953, which changes the Makefile; this fork keeps the
+        # modules/livestore runs out of memory on the 16 GB runner, which then
+        # loses contact with GitHub or terminates the job (exit 143). It runs
+        # as its own job, one process per test (see xs-test-livestore.sh).
+        # Upstream split it out of test-with-cover-others in
+        # grafana/tempo#7953 by changing the Makefile; this fork keeps the
         # Makefile identical to upstream, so the split overrides OTHERS_SRC on
-        # the make command line instead.
+        # the make command line.
         run: |
+          # make_var prints a variable of upstream's Makefile.
+          make_var() { printf 'xs-print:\n\t@echo $(%s)\n' "$1" | make -s -f Makefile -f - xs-print; }
           case "$TEST_TARGET" in
-            test-with-cover-others|test-with-cover-livestore)
-              # Package directories of upstream's OTHERS_SRC.
-              printf 'xs-print-others-src:\n\t@echo $(OTHERS_SRC)\n' \
-                | make -s -f Makefile -f - xs-print-others-src \
-                | tr ' ' '\n' | xargs -n1 dirname | sort -u > "$RUNNER_TEMP/others-dirs"
-              if [ "$TEST_TARGET" = test-with-cover-livestore ]; then
-                dirs=$(grep -E '^\./modules/livestore(/|$)' "$RUNNER_TEMP/others-dirs")
-              else
-                dirs=$(grep -v -E '^\./modules/livestore(/|$)' "$RUNNER_TEMP/others-dirs")
-              fi
+            test-with-cover-livestore)
+              # Same flags as upstream's test targets.
+              # shellcheck disable=SC2046
+              .github/scripts/xs-test-livestore.sh $(make_var GOTEST_OPT)
+              ;;
+            test-with-cover-others)
+              # Package directories of upstream's OTHERS_SRC, without livestore.
+              dirs=$(make_var OTHERS_SRC | tr ' ' '\n' | xargs -n1 dirname | sort -u \
+                | grep -v -E '^\./modules/livestore(/|$)')
               test -n "$dirs"
               # Trailing slashes: the make target takes $(dir ...) of each entry.
               make test-with-cover-others OTHERS_SRC="$(printf '%s/ ' $dirs)"
