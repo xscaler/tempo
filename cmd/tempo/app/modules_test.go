@@ -189,6 +189,9 @@ func TestInitLiveStoreSingleBinaryUsesLocalIngest(t *testing.T) {
 	cfg.LiveStore.WAL.Filepath = t.TempDir()
 	cfg.LiveStore.ShutdownMarkerDir = t.TempDir()
 	cfg.LiveStore.Ring.InstanceID = "single-binary"
+	// A fixed address, as the livestore tests use: the default lookup of the
+	// eth0/en0 interfaces fails on hosts that name their interfaces otherwise.
+	cfg.LiveStore.Ring.InstanceAddr = "localhost"
 
 	partitionRingStore, partitionRingCloser := consul.NewInMemoryClient(dskitring.GetPartitionRingCodec(), log.NewNopLogger(), nil)
 	defer partitionRingCloser.Close()
