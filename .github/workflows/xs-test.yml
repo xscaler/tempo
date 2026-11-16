@@ -101,6 +101,9 @@ jobs:
           - test-with-cover-tempodb
           - test-with-cover-tempodb-wal
           - test-with-cover-others
+          # Not an upstream make target: modules/livestore split out of
+          # test-with-cover-others (see the Run tests step).
+          - test-with-cover-livestore
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -115,7 +118,34 @@ jobs:
       - name: Run tests
         env:
           TEST_TARGET: ${{ matrix.test-target }}
-        run: make "$TEST_TARGET"
+        # modules/livestore runs out of memory on the 16 GB runner, which then
+        # loses contact with GitHub or terminates the job (exit 143). It runs
+        # as its own job, one process per test (see xs-test-livestore.sh).
+        # Upstream split it out of test-with-cover-others in
+        # grafana/tempo#7953 by changing the Makefile; this fork keeps the
+        # Makefile identical to upstream, so the split overrides OTHERS_SRC on
+        # the make command line.
+        run: |
+          # make_var prints a variable of upstream's Makefile.
+          make_var() { printf 'xs-print:\n\t@echo $(%s)\n' "$1" | make -s -f Makefile -f - xs-print; }
+          case "$TEST_TARGET" in
+            test-with-cover-livestore)
+              # Same flags as upstream's test targets.
+              # shellcheck disable=SC2046
+              .github/scripts/xs-test-livestore.sh $(make_var GOTEST_OPT)
+              ;;
+            test-with-cover-others)
+              # Package directories of upstream's OTHERS_SRC, without livestore.
+              dirs=$(make_var OTHERS_SRC | tr ' ' '\n' | xargs -n1 dirname | sort -u \
+                | grep -v -E '^\./modules/livestore(/|$)')
+              test -n "$dirs"
+              # Trailing slashes: the make target takes $(dir ...) of each entry.
+              make test-with-cover-others OTHERS_SRC="$(printf '%s/ ' $dirs)"
+              ;;
+            *)
+              make "$TEST_TARGET"
+              ;;
+          esac
 
   integration-tests-validation:
     name: Validate integration test coverage
